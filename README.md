@@ -263,8 +263,12 @@ Requirements:
 
 - Everything the Mac build needs (above), plus Xcode 26 or later with the iOS SDK, and `brew install xcodegen cmake`.
   The first build downloads and compiles Opus and libvpx for iOS, so it needs network access.
-- iOS / iPadOS 26 on an iPhone 14 or newer (A15 or later), or an iPad on iPadOS 26 with an A15 chip or later. These
-  are the original project's requirements and have not been tested with this game.
+- **iOS / iPadOS 27** on an iPhone 14 or newer (A15 or later), or an iPad with an A15 chip or later. Checked on an
+  iPhone 15 Pro Max and an iPhone 17 Pro Max on iOS 27; iPad and older iPhones are untested. On iOS 26 the app closes
+  right after opening: the game needs one continuous block of about 61 GB of memory addresses below 512 GB (address
+  space, not RAM), and iOS 26 gives an app at most 51 GB in one piece there (its `log.txt` ends with
+  `FAIL: reserve guest stack, heap and alias regions`). iOS 27 gives apps the room. Update to iOS 27; no reinstall
+  needed.
 - Optional: Xcode's Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`). With it the build compiles the
   carried shaders for the device. Without it they stay Metal source, and the device compiles each one the first time it
   is used.
