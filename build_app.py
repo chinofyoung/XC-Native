@@ -1884,7 +1884,7 @@ def build_all(args, plat, out, work, logs, t0):
             f'"{out}" --device "<device name>" --game-data "{work / app_bundle.romfs(VERSION) / "romfs.bin"}") or with a '
             'sideloading tool that keeps its entitlements. It holds no game image: install_device.py --game-data copies the '
             '14.3 GB RomFS once into the app\'s Documents/GameData, or drag romfs.bin onto the app in Finder (the device > '
-            'Files). Needs iOS / iPadOS 26 and an iPhone 14 or newer. The app holds the game code: keep it for your own use, '
+            'Files). Needs iOS / iPadOS 27 (on 26 it closes at start) and an iPhone 14 or newer. The app holds the game code: keep it for your own use, '
             'never share it.')
         return
     plat['package'](work, out, logs, prep=prep)
