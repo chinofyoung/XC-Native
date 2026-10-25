@@ -58,6 +58,13 @@ static void apply_file(Module *m, const char *slug) {
      6.4 m/s at 44 fps against 8.8 m/s at 30 fps). The game's other per-frame steps are listed in that entry.
    The host page is the writable 16 KiB page the loader reserves right after main's image (main's size + 0x4000).
    Veneers go in the zero padding between main's text and its read-only data. Every original word is checked first.
+   - Sites 3 and 4, the timed B-button prompt (the "Soul Challenge"; CHANGELOG "60 fps: the timed B-button prompt"): a
+     HUD class (constructor v200 main+0x5c56c4) reads the ring's lifetime N in 30 fps frames from BDAT BTL_BtnChallengeLv
+     and keeps speed = 30/N (+0x120). Every frame its update takes speed off the ring (+0x11c, 30 to 0; main+0x5c6280:
+     ldr s1, [x19, #0x120]; fsub), and the Perfect/Good judge measures ring + speed (main+0x5c64fc: ldr s1, [x0, #0x120];
+     fadd). Neither reads GetFrameTime, so at 60 fps the ring ran out in half the time. Each load branches to a veneer that
+     reloads speed and, in mode 1, multiplies it by frame time x 30 (one 30 fps frame's share), then goes back; mode 0
+     keeps the shipped step. The frame-counted sound cue of the same class (+0x114) is not changed.
    XCX_FPS60=0 with the patch keeps N = 2 and the original GetFrameTime (A/B in one build; iOS's "off"). On iOS code pages
    cannot be written at run time: ios/tools/build_ipa.py exports main's text with these sites patched (TOTK_EXPORT_IOS)
    and the device only checks that the patched words are there; the Settings switch picks the page's values. */
@@ -68,6 +75,26 @@ static void apply_file(Module *m, const char *slug) {
 #define FPS60_VSYNC_SITE 0x13eb280ULL       /* mov w0, #2; bl SetVsyncCount (main+0x13b2d18) */
 #define FPS60_FRAME_TIME 0x13b224cULL       /* GetFrameTime() */
 #endif
+#if defined(XCX_GAME_V200)
+#define FPS60_QTE_RING  0x5c6280ULL         /* ldr s1, [x19, #0x120]: the prompt's step a frame (update main+0x5c6208) */
+#define FPS60_QTE_JUDGE 0x5c64fcULL         /* ldr s1, [x0, #0x120]: the same step in its judge (main+0x5c64c0) */
+#else
+#define FPS60_QTE_RING  0x5c5870ULL         /* 1.0.1: the class's code is the same, 0xa10 bytes earlier */
+#define FPS60_QTE_JUDGE 0x5c5aecULL
+#endif
+/* The prompt's veneer (sites 3 and 4; scripts/verify_fps60_qte_patch.py runs it): word 0 is the site's own load, word 1
+   the adrp and word 8 the branch back, filled in by fps60_qte. x16, x17 and s2 are free at both sites. */
+static const uint32_t fps60_qte_veneer[9] = {
+    0,              /* ldr s1, [x19 | x0, #0x120]: speed, ring units a frame (the site's original word) */
+    0,              /* adrp x16, <host page> */
+    0xb9400a11u,    /* ldr w17, [x16, #8]: mode */
+    0x340000b1u,    /* cbz w17, +20: mode 0 keeps the shipped step */
+    0xbd400202u,    /* ldr s2, [x16]: measured frame time */
+    0x1e220821u,    /* fmul s1, s1, s2 */
+    0x1e27d002u,    /* fmov s2, #30.0 */
+    0x1e220821u,    /* fmul s1, s1, s2 */
+    0,              /* b <site + 4> */
+};
 #if TARGET_OS_IPHONE
 #define CODE_PATCHED_AT_BUILD 1
 #else
@@ -101,6 +128,13 @@ static void fps60_put(Module *m, uint64_t off, uint32_t original, uint32_t word,
                             runtime_fail("60 fps patch does not match this game version"); }
     memcpy(m->base + off, &word, 4);
 }
+static void fps60_qte(Module *m, uint64_t ven, uint64_t site, uint32_t load, uint64_t page, const char *what) {
+    uint32_t w[9]; memcpy(w, fps60_qte_veneer, sizeof w);
+    w[0] = load; w[1] = enc_adrp(16, ven + 4, page); w[8] = enc_branch(ven + 32, site + 4, 0);
+    for (unsigned i = 0; i < 9; i++) fps60_put(m, ven + 4 * i, 0, w[i], "veneer (prompt timer)");
+    fps60_put(m, site, load, enc_branch(site, ven, 0), what);
+    if (!CODE_PATCHED_AT_BUILD) { sys_icache_invalidate(m->base + ven, sizeof w); sys_icache_invalidate(m->base + site, 4); }
+}
 static void apply_fps60(Module *m) {
     const uint64_t page = (m->file_size + 0x3fff) & ~0x3fffULL;
     if (page + 0x4000 != m->size) runtime_fail("60 fps: host page layout");
@@ -108,8 +142,13 @@ static void apply_fps60(Module *m) {
     /* Checked only: the call after the mov goes to SetVsyncCount, and GetFrameTime's next two words are its prologue. */
     if (!CODE_PATCHED_AT_BUILD && word_at(m, vsync + 4) != 0x97ff1ea5u) runtime_fail("60 fps: SetVsyncCount call differs");
     if (word_at(m, ft + 4) != 0xf9000bf3u || word_at(m, ft + 8) != 0x910003fdu) runtime_fail("60 fps: GetFrameTime prologue differs");
+    const uint64_t qr = FPS60_QTE_RING, qj = FPS60_QTE_JUDGE;
+    /* Checked only: the ring load before site 3, the fsub after it; the judge's ring load before site 4, the fadd after it. */
+    if (word_at(m, qr - 0x14) != 0xbd411e60u || word_at(m, qr + 4) != 0x1e213800u ||
+        word_at(m, qj - 0xc) != 0xbd411c00u || word_at(m, qj + 4) != 0x1e212800u) runtime_fail("60 fps: prompt timer code differs");
     const uint64_t v0 = (m->text_end + 15) & ~15ULL, end = (m->text_end + 0xfff) & ~0xfffULL;
     const uint64_t v1 = v0 + 16;   /* veneer 1: 3 words (16 bytes slot); veneer 2: 8 words */
+    const uint64_t v2 = v1 + 32, v3 = v2 + 48;   /* the prompt's veneers: 9 words each (48 bytes slots) */
     const uint32_t ven_vsync[3] = {enc_adrp(0, v0, page), 0xb9400400u /* ldr w0, [x0, #4] */, 0xd65f03c0u /* ret */};
     const uint32_t ven_ft[8] = {enc_adrp(16, v1, page),
                                 0xb9400a11u,                 /* ldr w17, [x16, #8]: mode */
@@ -118,13 +157,15 @@ static void apply_fps60(Module *m) {
                                 0xd65f03c0u,                 /* ret */
                                 0xa9be7bfdu,                 /* stp x29, x30, [sp, #-0x20]!  (GetFrameTime's first word) */
                                 enc_branch(v1 + 24, ft + 4, 0), 0};
-    if (v1 + sizeof ven_ft > end) runtime_fail("60 fps: veneers reach read-only data");
+    if (v3 + sizeof fps60_qte_veneer > end) runtime_fail("60 fps: veneers reach read-only data");
     for (unsigned i = 0; i < 3; i++) fps60_put(m, v0 + 4 * i, 0, ven_vsync[i], "veneer (vsync count)");
     for (unsigned i = 0; i < 7; i++) fps60_put(m, v1 + 4 * i, 0, ven_ft[i], "veneer (frame time)");
     fps60_put(m, vsync, 0x52800040u, enc_branch(vsync, v0, 1), "vsync count (mov w0, #2)");
     fps60_put(m, ft, 0xa9be7bfdu, enc_branch(ft, v1, 0), "GetFrameTime");
     if (!CODE_PATCHED_AT_BUILD) sys_icache_invalidate(m->base + v0, (size_t)(v1 + 28 - v0));
     if (!CODE_PATCHED_AT_BUILD) { sys_icache_invalidate(m->base + vsync, 4); sys_icache_invalidate(m->base + ft, 4); }
+    fps60_qte(m, v2, qr, 0xbd412261u, page, "prompt ring step (ldr s1, [x19, #0x120])");
+    fps60_qte(m, v3, qj, 0xbd412001u, page, "prompt judge (ldr s1, [x0, #0x120])");
     fps60_page = (Fps60Page *)(void *)(m->base + page);
     const char *e = getenv("XCX_FPS60"); fps60_on = !(e && !strcmp(e, "0"));
     float sixtieth = 1.0f / 60.0f; uint32_t bits; memcpy(&bits, &sixtieth, 4);
@@ -135,6 +176,9 @@ static void apply_fps60(Module *m) {
             TOTK_GAME_VERSION, fps60_on ? "on (vsync count 1, measured frame time)" : "off by XCX_FPS60=0 (vsync count 2, original frame time)",
             (unsigned long long)vsync, (unsigned long long)ft, (unsigned long long)v0, (unsigned long long)(v1 + 28),
             CODE_PATCHED_AT_BUILD ? " (embedded at build time)" : "");
+    fprintf(stderr, "[xcx] game patch 60fps (%s): timed B-button prompt %s; ring step main+%#llx, judge main+%#llx, veneers main+%#llx..+%#llx\n",
+            TOTK_GAME_VERSION, fps60_on ? "on (step x frame time x 30)" : "off by XCX_FPS60=0 (shipped step)",
+            (unsigned long long)qr, (unsigned long long)qj, (unsigned long long)v2, (unsigned long long)(v3 + sizeof fps60_qte_veneer));
 }
 
 void runtime_game_patches(Module *main_module) {
