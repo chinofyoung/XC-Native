@@ -44,6 +44,7 @@ static uint64_t g_gen_shown;            // interpolated frames handed to the scr
 #include "totk_lifelog.h"
 #include "totk_timeline.h"
 #include "nvn_pool_index.h"
+#include "usnap_split.h"
 #include "../../host/dm.h"
 #import <CommonCrypto/CommonDigest.h>
 #include <stdarg.h>
@@ -812,8 +813,39 @@ static void pend_begin(void) {
    READY, DROPPED = a GPU write of this submission hit it (read memory). Lookups from inside the copy routine never wait
    (they read memory, as the single-threaded version did for entries not yet valid). TOTK_USNAP_HELPERS=0 copies inline. */
 enum { US_PENDING, US_COPYING, US_READY, US_DROPPED };
-typedef struct { uint64_t lo, hi, gpu; uint8_t *cpu; _Atomic int st; } usnap_t;
+typedef struct { uint64_t lo, hi, gpu; uint8_t *cpu; _Atomic int st; _Atomic uint32_t dh; uint32_t dn; } usnap_t;   // dh / dn: this submission's GPU writes into part of the copy (usnap_dn)
 static usnap_t *g_usnap; static int g_nusnap, g_capusnap;
+/* TOTK (2026-10-25): 本次提交里 GPU 只写了一份拷贝的一部分时，只让那部分读内存，其余字节仍用快照（以前整份最多 1 MiB 都改读
+   内存，与游戏写下一帧赛跑）。每份拷贝挂一条只增不改的链（dh = 最新节点下标 + 1），节点先写好再 release 发布，辅助线程可同时读。
+   TOTK (2026-10-25): a GPU write of this submission into part of a copy makes only that part read memory; the rest keeps
+   the snapshot (the whole copy, up to 1 MiB, used to go live and race with the game writing the next frame). Each copy has
+   an append-only list (dh = newest node + 1); a node is written before dh publishes it (release), so helper threads may read
+   it meanwhile. Past USD_PER writes into one copy or USD_MAX per submission, the whole copy is dropped as before.
+   TOTK_USNAP_SPLIT=0 / "flag usnap_split 0": whole copies again (here and in usnap_take); =prev / =self: only the cut
+   around earlier submissions' writes (usnap_take) / only this partial drop. The flag switches the partial drop at once
+   and the cut at the next submission's snapshot. */
+typedef struct { uint64_t lo, hi; uint32_t next; } usnap_dn;
+#define USD_MAX 8192
+#define USD_PER 16
+static usnap_dn g_usd[USD_MAX]; static int g_nusd;
+static uint64_t g_usnap_pdrops, g_usnap_pdrop_bytes;     // partial drops (cumulative): count, bytes they left live
+static uint64_t g_usnap_split_n, g_usnap_split_live;    // ranges cut around earlier submissions' unfinished writes (cumulative), bytes left live in them
+static uint64_t g_usnap_skip_inexact;                   // of g_usnap_skip_gpu: ranges skipped whole because a write of unknown extent overlaps them
+static _Atomic int g_usnap_split = -1;   // bit 0: cut around earlier submissions' writes, bit 1: partial drops within the submission
+static int usnap_split_on(void) {
+    int v = atomic_load(&g_usnap_split);
+    if (v < 0) {
+        const char *e = getenv("TOTK_USNAP_SPLIT");
+        v = !e ? 3 : !strcmp(e, "0") ? 0 : !strcmp(e, "prev") ? 1 : !strcmp(e, "self") ? 2 : 3; atomic_store(&g_usnap_split, v);
+        MLOG("uniform 快照遇 GPU 写入：%s", v == 3 ? "只让 GPU 写的字节读内存，其余照常拷贝" : v == 0 ? "整段读内存（TOTK_USNAP_SPLIT=0，旧行为）" : v == 1 ? "只切前次提交的写入（TOTK_USNAP_SPLIT=prev）" : "只切本次提交的写入（TOTK_USNAP_SPLIT=self）");
+    }
+    return v;
+}
+static inline int usnap_dhit(const usnap_t *c, uint64_t a, uint64_t n) {   // [a, a+n) touches a part of the copy a GPU write of this submission dropped
+    for (uint32_t h = atomic_load_explicit(&((usnap_t *)c)->dh, memory_order_acquire); h; h = g_usd[h - 1].next)
+        if (a < g_usd[h - 1].hi && a + n > g_usd[h - 1].lo) return 1;
+    return 0;
+}
 static uint64_t g_usnap_waits, g_usnap_self; static _Atomic uint64_t g_usnap_helped;   // bindings that waited for a helper / copied the entry themselves; entries the helpers copied
 static _Atomic int g_usnap_on = -1;
 static uint64_t g_usnap_bytes, g_usnap_n, g_usnap_drops, g_usnap_subs, g_usnap_ns;
@@ -846,6 +878,7 @@ static const usnap_t *usnap_find_slow(uint64_t a, uint64_t n, int wait) {   // w
     int i = usnap_first(a);
     if (!(i < g_nusnap && g_usnap[i].lo <= a && a + n <= g_usnap[i].hi)) return NULL;
     usnap_t *c = &g_usnap[i];
+    if (usnap_dhit(c, a, n)) return NULL;   // the GPU writes these bytes within this submission: memory
     for (;;) {
         int st = atomic_load_explicit(&c->st, memory_order_acquire);
         if (st == US_READY) return c;
@@ -862,7 +895,7 @@ static const usnap_t *usnap_find(uint64_t a, uint64_t n) {   // ready copy holdi
     const usnap_t *c=i<(uint32_t)g_nusnap?&g_usnap[i]:NULL;
     // List rebuilds, reallocations, GPU writes, and hash collisions all recheck
     // the authoritative entry. Snapshot ranges are disjoint, so containment is unique.
-    if(c && (atomic_load_explicit(&c->st, memory_order_acquire) == US_READY || g_usnap_index_negative) && c->lo<=a && a<c->hi && n<=c->hi-a) {
+    if(c && (atomic_load_explicit(&c->st, memory_order_acquire) == US_READY || g_usnap_index_negative) && c->lo<=a && a<c->hi && n<=c->hi-a && !usnap_dhit(c,a,n)) {
         g_usnap_index_hits++;
         if(atomic_load(&g_usnap_index_check)) {
             if(c!=usnap_find_slow(a,n,1))MDIE("uniform snapshot index mismatch");
@@ -881,23 +914,64 @@ static void usnap_read_x(uint64_t a, void *out, size_t n, int wait) {
 static void usnap_read(uint64_t a, void *out, size_t n) { usnap_read_x(a, out, n, 1); }
 /* Ranges the GPU writes (writable storage buffers, buffer copies, texture-to-buffer copies, inline updates written on the
    GPU timeline), with the fence of their submission: a copy taken at a later submit call while one of them is still
-   executing would miss the GPU's result, so such ranges are not copied (they are read on the GPU timeline as before). */
-typedef struct { uint64_t lo, hi, fence; } gw_t;
+   executing would miss the GPU's result, so such bytes are not copied (they are read on the GPU timeline as before; since
+   2026-10-25 only those bytes, usnap_take cuts the rest of the range out and copies it). */
+typedef usnap_gw gw_t;   // {lo, hi, fence} (usnap_split.h)
 static gw_t *g_gw; static int g_ngw, g_capgw;
 static uint64_t g_usnap_skip_gpu;
 static int g_usnap_drop_off;   // probe-gpu-ubo-snapshot negative control only
-static void usnap_drop(uint64_t a, uint64_t n) {   // the GPU writes [a, a+n) within this submission
+/* exact = 0 (TOTK 2026-10-25): the extent is a guess (storage-buffer pointer read from a uniform block, binding without a
+   size), the GPU may write past it: the copies it touches are dropped whole and, in a later submission's usnap_take, a range
+   it overlaps is skipped whole (the old behaviour) instead of cut. */
+static void usnap_drop(uint64_t a, uint64_t n, int exact) {   // the GPU writes [a, a+n) within this submission
     if (!n) return;
     if (usnap_on()) {
         int dup = 0;   // the same buffer bound for many dispatches in a row: log it once
-        for (int j = g_ngw - 1; j >= 0 && j >= g_ngw - 8; j--) if (g_gw[j].lo == a && g_gw[j].hi == a + n && g_gw[j].fence == g_fence + 1) { dup = 1; break; }
+        for (int j = g_ngw - 1; j >= 0 && j >= g_ngw - 8; j--) if (g_gw[j].lo == a && g_gw[j].hi == a + n && g_gw[j].fence == g_fence + 1 && g_gw[j].inexact == !exact) { dup = 1; break; }
         if (!dup) {
             if (g_ngw == g_capgw) { g_capgw = g_capgw ? g_capgw * 2 : 4096; g_gw = realloc(g_gw, g_capgw * sizeof *g_gw); if (!g_gw) MDIE("GPU write ranges"); }
-            g_gw[g_ngw++] = (gw_t){a, a + n, g_fence + 1};
+            g_gw[g_ngw++] = (gw_t){a, a + n, g_fence + 1, !exact};
         }
     }
     if (!g_nusnap || g_usnap_drop_off) return;
-    for (int i = usnap_first(a); i < g_nusnap && g_usnap[i].lo < a + n; i++) if (atomic_exchange(&g_usnap[i].st, US_DROPPED) != US_DROPPED) g_usnap_drops++;   // a helper still copying it finds DROPPED when it is done and leaves it
+    int sp = exact && (usnap_split_on() & 2);
+    for (int i = usnap_first(a); i < g_nusnap && g_usnap[i].lo < a + n; i++) {
+        usnap_t *c = &g_usnap[i]; uint64_t lo = a > c->lo ? a : c->lo, hi = a + n < c->hi ? a + n : c->hi;
+        if (sp && (lo > c->lo || hi < c->hi) && c->dn < USD_PER && g_nusd < USD_MAX) {   // part of the copy: only [lo, hi) reads memory from now on
+            if (atomic_load_explicit(&c->st, memory_order_relaxed) == US_DROPPED) continue;
+            uint32_t h = atomic_load_explicit(&c->dh, memory_order_relaxed);
+            if (h && g_usd[h - 1].lo <= lo && hi <= g_usd[h - 1].hi) continue;   // the same buffer bound for the next dispatch
+            g_usd[g_nusd] = (usnap_dn){lo, hi, h}; atomic_store_explicit(&c->dh, (uint32_t)++g_nusd, memory_order_release); c->dn++;
+            g_usnap_drops++; g_usnap_pdrops++; g_usnap_pdrop_bytes += hi - lo;   // g_usnap_drops also keys the argument-buffer epoch (arg_epoch_current)
+            continue;
+        }
+        if (atomic_exchange(&c->st, US_DROPPED) != US_DROPPED) g_usnap_drops++;   // a helper still copying it finds DROPPED when it is done and leaves it
+    }
+}
+static int g_ngw_prev; static uint64_t g_gw_prev_maxlen;   // g_gw[0, g_ngw_prev): earlier submissions' writes not finished at this submission's start, sorted by lo
+static int gw_cmp(const void *x, const void *y) { const gw_t *a = x, *b = y; return a->lo < b->lo ? -1 : a->lo > b->lo; }
+static void gw_compact(uint64_t done) {   // submission start: keep the unfinished writes, sorted (usnap_take's cut and gw_cpu_read use this prefix)
+    int ng = 0; uint64_t ml = 0;
+    for (int i = 0; i < g_ngw; i++) if (g_gw[i].fence > done) { g_gw[ng++] = g_gw[i]; if (g_gw[i].hi - g_gw[i].lo > ml) ml = g_gw[i].hi - g_gw[i].lo; }
+    g_ngw = ng;
+    if (ng > 1) qsort(g_gw, (size_t)ng, sizeof *g_gw, gw_cmp);
+    g_ngw_prev = ng; g_gw_prev_maxlen = ml;
+}
+/* TOTK diagnostic (2026-10-25)：回放自己在 CPU 上读 [a, a+n)（改名的 uniform 副本、存储缓冲指针、间接派发的组数）时，前面某次
+   提交里 GPU 对它的写入还没完成、又不是拷贝 / 内联更新（那些由待写表提供）：CPU 读到的是旧值。只计数（uniform 快照统计行后）。
+   TOTK diagnostic (2026-10-25): the replay itself reads [a, a+n) on the CPU (renamed uniform copies, storage-buffer pointers,
+   indirect group counts) while an earlier submission's GPU write to it has not finished and is not a copy / inline update
+   (those the pending table supplies): the CPU sees the old bytes. Only counted (line after the uniform snapshot stats);
+   needs the uniform snapshot (g_gw is recorded only then). */
+static uint64_t g_gw_cpu_stale;
+static void gw_cpu_read(uint64_t a, uint64_t n) {
+    if (!g_ngw_prev || !n) return;
+    uint64_t done = __atomic_load_n(&g_done, __ATOMIC_ACQUIRE);
+    for (int i = usnap_gw_first(g_gw, g_ngw_prev, a, g_gw_prev_maxlen); i < g_ngw_prev && g_gw[i].lo < a + n; i++) {
+        if (g_gw[i].hi <= a || g_gw[i].fence <= done) continue;
+        int pend = 0; for (int j = 0; j < g_npend && !pend; j++) pend = g_pend_fence[j] == g_gw[i].fence && g_pend_lo[j] <= g_gw[i].lo && g_pend_hi[j] >= g_gw[i].hi;
+        if (!pend) { g_gw_cpu_stale++; return; }
+    }
 }
 /* TOTK: the value guest memory [a, a+n) will hold once this submission's pending writes (inline uniform updates,
    GPU copies) have executed: the replay needs it on the CPU for pointers the shader loads from a user uniform block.
@@ -912,6 +986,7 @@ static int pend_read(uint64_t a, void *out, size_t n, int depth) {
         if (depth < 4) { int r = pend_read(src, out, n, depth + 1); return r < 0 ? -1 : 1; }
         memcpy(out, (const void *)(uintptr_t)src, n); return 1;
     }
+    gw_cpu_read(a, n);   // diagnostic (g_gw_cpu_stale)
     usnap_read(a, out, n);
     return pend_over() ? -1 : 0;
 }
@@ -1006,6 +1081,7 @@ void mtl_sub_begin(void) {
        warm_claim and pt_apply_request autoreleased before it piled up every submission (nxnative found the same leak:
        an iPhone killed for memory in a shrine, docs/agents/04-graphics.md). */
     g_sub_pool = objc_autoreleasePoolPush();
+    g_ngw_prev = 0;   // set again by the snapshot call (gw_compact)
     if (g_cg.ng) { static int once; if (!once++) MLOG("【红】[cube-merge] 上次提交结束时还有 %d 组没落地（不应发生）", g_cg.ng); g_cg.ng = 0; } g_cg_pending = 0; g_cg.take_seq = ~0ull;
     mtl_init(); g_sub_serial++;
     { static int ka; if (!ka) { ka = 1; keepalive_start(); } atomic_store(&g_last_sub_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW)); }
@@ -1074,12 +1150,13 @@ static int bar_end_on(void) { static int v = -1; if (v < 0) { const char *e = ge
 static int bar_start_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_BARRIER_START"); v = !(e && !strcmp(e, "0")); if (!v) fprintf(stderr, "[dm] [nvn-mtl] 【实验】TOTK_BARRIER_START=0：回放编码器开头不设消费者屏障（有数据竞争，只供测量）\n"); } return v; }
 static MTL4VisibilityOptions bar_vis(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_BARRIER_VIS"); v = !(e && !strcmp(e, "0")); if (!v) fprintf(stderr, "[dm] [nvn-mtl] 【实验】TOTK_BARRIER_VIS=0：回放编码器开头屏障不带缓存可见性\n"); } return v ? MTL4VisibilityOptionDevice : MTL4VisibilityOptionNone; }
 static MTL4VisibilityOptions blit_vis(void) { return bar_vis() | (g_blit_alias ? MTL4VisibilityOptionResourceAlias : 0); }
+static int g_qbar_probe_off;   // probe-gpu-order negative control only: no queue barriers at the end of encoders / the start of the shared compute encoder
 static inline void m4_end(id e) {
     if (e == g_blit && g_blit_alias) {
         [g_blit barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionResourceAlias];
         g_blit_alias = 0;
     }
-    if (bar_end_on() && [e conformsToProtocol:@protocol(MTL4CommandEncoder)]) [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+    if (bar_end_on() && !g_qbar_probe_off && [e conformsToProtocol:@protocol(MTL4CommandEncoder)]) [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
     [e endEncoding];
 }
 /* TOTK_BARRIER_NARROW (2026-10-16): 2 = between render passes order only what the next pass can actually depend on: copies and
@@ -1340,7 +1417,6 @@ static void rng_sort(usnap_rng *a, int n) {
     }
     if (src != a) memcpy(a, src, (size_t)n * sizeof *a);
 }
-static int gw_cmp(const void *x, const void *y) { const gw_t *a = x, *b = y; return a->lo < b->lo ? -1 : a->lo > b->lo; }
 /* With the translation thread (TOTK_ASYNC_REPLAY=1) nvnQueueSubmitCommands returns before the replay, as on the console,
    and the game rebuilds its constant pools right away: the uniform bytes are captured in the submit call (game thread)
    and the replay builds its copies from them. done: fence completion at the capture; a GPU write of an earlier submission
@@ -1431,7 +1507,8 @@ static void usnap_finish(void) {   // this submission's copies are about to be r
 void mtl_sub_snapshot_ubos_cap(const uint64_t *h, int n, void *capv) {
     usnap_cap *cap = capv;
     usnap_finish();
-    g_nusnap = 0;
+    g_nusnap = 0; g_nusd = 0;   // the helpers are done: no one reads the previous submission's drop nodes any more
+    g_ngw_prev = 0;
     if (!usnap_on()) { g_ngw = 0; ucap_free(cap); g_fc_snap_end = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); return; }
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     usnap_take(h, n, cap);   // keeps cap in g_usnap_cap until the copies are done (usnap_finish)
@@ -1440,14 +1517,16 @@ void mtl_sub_snapshot_ubos_cap(const uint64_t *h, int n, void *capv) {
     g_usnap_n += (uint64_t)g_nusnap;
     if (++g_usnap_subs % 1800 == 0) {
         uint64_t cns = atomic_exchange(&g_ucap_ns, 0), cby = atomic_exchange(&g_ucap_bytes, 0);
-        MLOG("[nvn] uniform 提交时快照：每次提交平均 %.0f 段 / %.1f KB / 回放线程 %.3f ms（收集排序 %.3f / 合并 %.3f / 分配并派发 %.3f）；辅助线程拷 %llu 段、回放自取 %llu 段、等辅助线程 %llu 次；本次提交里 GPU 写入使快照失效共 %llu 段，因前次提交的 GPU 写入未完成而不拷贝共 %llu 段%s",
+        MLOG("[nvn] uniform 提交时快照：每次提交平均 %.0f 段 / %.1f KB / 回放线程 %.3f ms（收集排序 %.3f / 合并 %.3f / 分配并派发 %.3f）；辅助线程拷 %llu 段、回放自取 %llu 段、等辅助线程 %llu 次；本次提交里 GPU 写入使快照失效共 %llu 段（其中 %llu 段只让 GPU 写的 %.1f KB 读内存），因前次提交的 GPU 写入未完成而不拷贝共 %llu 段（整段读内存，其中写入范围未知 %llu 段；另切开 %llu 段，只让 GPU 写的 %.1f KB 读内存）%s",
              (double)g_usnap_n / 1800, (double)g_usnap_bytes / 1800 / 1024, (double)g_usnap_ns / 1800 / 1e6,
              (double)g_usnap_t[0] / 1800 / 1e6, (double)g_usnap_t[1] / 1800 / 1e6, (double)g_usnap_t[2] / 1800 / 1e6,
              (unsigned long long)atomic_load(&g_usnap_helped), (unsigned long long)g_usnap_self, (unsigned long long)g_usnap_waits,
-             (unsigned long long)g_usnap_drops, (unsigned long long)g_usnap_skip_gpu,
+             (unsigned long long)g_usnap_drops, (unsigned long long)g_usnap_pdrops, (double)g_usnap_pdrop_bytes / 1024,
+             (unsigned long long)g_usnap_skip_gpu, (unsigned long long)g_usnap_skip_inexact, (unsigned long long)g_usnap_split_n, (double)g_usnap_split_live / 1024,
              cby ? [NSString stringWithFormat:@"；翻译线程模式：提交调用里先拷 %.1f KB / %.3f ms（游戏线程）", (double)cby / 1800 / 1024, (double)cns / 1800 / 1e6].UTF8String : "");
         g_usnap_n = g_usnap_bytes = g_usnap_ns = 0; g_usnap_t[0] = g_usnap_t[1] = g_usnap_t[2] = 0; atomic_store(&g_usnap_helped, 0); g_usnap_self = g_usnap_waits = 0;
         cg_stats_line();
+        if (g_gw_cpu_stale) { MLOG("[nvn] 回放在 CPU 上读到前面提交未完成的 GPU 写入（非拷贝 / 内联更新，读到旧值）共 %llu 处", (unsigned long long)g_gw_cpu_stale); g_gw_cpu_stale = 0; }
         { uint64_t f = atomic_load(&g_usnap_faults); if (f) MLOG("【红】uniform 快照拷贝读到不可访问地址累计 %llu 次（那些段改读内存）", (unsigned long long)f); }
         if (g_fc_n) MLOG("[nvn] 首段提交（每次提交平均，ms）：开始 %.3f / 快照 %.3f / 首段回放 %.3f / 等编码线程 %.3f / 上传冲刷 %.3f / 驻留提交 %.3f / 提交 %.3f%s",
                          (double)g_fc_t[0] / 1800 / 1e6, (double)g_usnap_ns / 1800 / 1e6, (double)g_fc_t[1] / g_fc_n / 1e6, (double)g_fc_t[2] / g_fc_n / 1e6,
@@ -1457,13 +1536,22 @@ void mtl_sub_snapshot_ubos_cap(const uint64_t *h, int n, void *capv) {
     }
 }
 void mtl_sub_snapshot_ubos(const uint64_t *h, int n) { mtl_sub_snapshot_ubos_cap(h, n, NULL); }
+static inline void usnap_add(uint64_t lo, uint64_t hi) {   // a copy of [lo, hi) (sorted after the previous one), bytes filled in phase 2
+    if (g_nusnap >= g_capusnap) MDIE("uniform copies: %d entries, room for %d", g_nusnap + 1, g_capusnap);
+    /* arena offsets are 256-aligned; a piece cut at the end of a GPU write starts anywhere, so the copy keeps lo's offset
+       within 256 bytes: every binding in it keeps the alignment of its real address (constant buffer pointers need it) */
+    size_t pad = (size_t)(lo & 255);
+    id<MTLBuffer> ab; size_t off = arena_alloc((size_t)(hi - lo) + pad, &ab) + pad;
+    usnap_t *c = &g_usnap[g_nusnap++];
+    c->lo = lo; c->hi = hi; c->gpu = ab.gpuAddress + off; c->cpu = (uint8_t *)ab.contents + off; c->dn = 0;
+    atomic_store_explicit(&c->st, US_PENDING, memory_order_relaxed); atomic_store_explicit(&c->dh, 0, memory_order_relaxed);
+    g_usnap_bytes += hi - lo;
+}
 static void usnap_take(const uint64_t *h, int n, const usnap_cap *cap) {
     uint64_t tq0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     uint64_t done = cap && !g_ucap_probe_now ? cap->done : __atomic_load_n(&g_done, __ATOMIC_ACQUIRE);
-    int ng = 0; uint64_t gw_maxlen = 0;   // GPU writes not finished at the capture, sorted by start
-    for (int i = 0; i < g_ngw; i++) if (g_gw[i].fence > done) { g_gw[ng++] = g_gw[i]; if (g_gw[i].hi - g_gw[i].lo > gw_maxlen) gw_maxlen = g_gw[i].hi - g_gw[i].lo; }
-    g_ngw = ng;
-    if (ng > 1) qsort(g_gw, (size_t)ng, sizeof *g_gw, gw_cmp);
+    gw_compact(done);   // GPU writes not finished at the capture, sorted by start (gw_cpu_read uses the same prefix)
+    int ng = g_ngw; uint64_t gw_maxlen = g_gw_prev_maxlen;
     g_usr.n = 0;
     if (cap) {   // the bindings as captured (merged, inside pools); the merge below works on them as on fresh ones
         if (cap->n > g_usr.cap) { g_usr.cap = cap->n + 256; g_usr.r = realloc(g_usr.r, g_usr.cap * sizeof *g_usr.r); if (!g_usr.r) MDIE("uniform copy ranges"); }
@@ -1483,23 +1571,32 @@ static void usnap_take(const uint64_t *h, int n, const usnap_cap *cap) {
         if (u[i].lo <= u[k].hi + 256 && hi - u[k].lo <= (1u << 20) && mtl_addr(u[k].lo, hi - u[k].lo, &mb, &mo)) u[k].hi = hi;
         else { usnap_rng r = u[i]; if (r.lo < u[k].hi) r.lo = u[k].hi; u[++k] = r; }
     }
-    int nr = k + 1;
-    if (nr > g_capusnap) { g_capusnap = nr + 256; g_usnap = realloc(g_usnap, g_capusnap * sizeof *g_usnap); if (!g_usnap) MDIE("uniform copies"); }
+    int nr = k + 1, sp = ng && (usnap_split_on() & 1);
+    int need = nr + (sp ? ng : 0);   // a write cuts at most one extra piece out of the one range its start lies in
+    if (need > g_capusnap) { g_capusnap = need + 256; g_usnap = realloc(g_usnap, g_capusnap * sizeof *g_usnap); if (!g_usnap) MDIE("uniform copies"); }
     uint64_t tq2 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); g_usnap_t[1] += tq2 - tq1;
     for (int i = 0; i < nr; i++) {
         void *mb; uint64_t mo; uint64_t sz = u[i].hi - u[i].lo;
         if (!mtl_addr(u[i].lo, sz, &mb, &mo)) continue;   // not in one pool: read live memory
-        if (ng) {   // a GPU write not finished at the capture overlaps it: read on the GPU timeline
-            uint64_t from = u[i].lo > gw_maxlen ? u[i].lo - gw_maxlen : 0; int a = 0, b = ng;
-            while (a < b) { int m = (a + b) >> 1; if (g_gw[m].lo < from) a = m + 1; else b = m; }
-            int hit = 0; for (int j = a; j < ng && g_gw[j].lo < u[i].hi; j++) if (g_gw[j].hi > u[i].lo) { hit = 1; break; }
+        /* TOTK (2026-10-25): a GPU write not finished at the capture overlapping the range: only the bytes it writes are read on
+           the GPU timeline, the pieces around it are copied as usual (usnap_cut; they stay sorted and disjoint, so a binding
+           touching the written bytes finds no copy and reads memory as before). The whole range used to go live: up to 1 MiB
+           of CPU-written constants racing with the game's next frame whenever the GPU is behind (fps60-investigation H1a).
+           TOTK_USNAP_SPLIT=0 skips the whole range again. */
+        int first = ng ? usnap_gw_first(g_gw, ng, u[i].lo, gw_maxlen) : 0;
+        if (sp && usnap_gw_inexact_hit(g_gw, ng, first, u[i].lo, u[i].hi)) { g_usnap_skip_gpu++; g_usnap_skip_inexact++; continue; }   // a write of unknown extent: whole range live, as before
+        if (sp) {
+            usnap_cut ct; usnap_cut_init(&ct, g_gw, ng, first, u[i].lo, u[i].hi);
+            uint64_t plo, phi; int np = 0;
+            while (usnap_cut_next(&ct, &plo, &phi)) { usnap_add(plo, phi); np++; }
+            if (ct.live) { if (np) { g_usnap_split_n++; g_usnap_split_live += ct.live; } else g_usnap_skip_gpu++; }   // cut / written whole
+            continue;
+        }
+        if (ng) {   // TOTK_USNAP_SPLIT=0: a GPU write not finished at the capture overlaps it: the whole range is read on the GPU timeline
+            int hit = 0; for (int j = first; j < ng && g_gw[j].lo < u[i].hi; j++) if (g_gw[j].hi > u[i].lo) { hit = 1; break; }
             if (hit) { g_usnap_skip_gpu++; continue; }
         }
-        id<MTLBuffer> ab; size_t off = arena_alloc((size_t)sz, &ab);
-        usnap_t *c = &g_usnap[g_nusnap++];
-        c->lo = u[i].lo; c->hi = u[i].hi; c->gpu = ab.gpuAddress + off; c->cpu = (uint8_t *)ab.contents + off;
-        atomic_store_explicit(&c->st, US_PENDING, memory_order_relaxed);
-        g_usnap_bytes += sz;
+        usnap_add(u[i].lo, u[i].hi);
     }
     // phase 2: the bytes. Helpers claim entries through the cursor; the replay goes on and copies what it needs first itself.
     g_usnap_cap = cap;
@@ -1533,7 +1630,7 @@ void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
     g_copy_n++; g_copy_split += g_enc != nil;
     upd_guard(src, src + n); upd_guard(dst, dst + n);
     pend_note(dst, n, (const void *)(uintptr_t)src, 1); pd_xfer("copy", src, dst, n);
-    usnap_drop(dst, n);   // TOTK: later readers see the copied bytes (memory, on the GPU timeline)
+    usnap_drop(dst, n, 1);   // TOTK: later readers see the copied bytes (memory, on the GPU timeline)
     anom_note_xfer('Y', src, dst, n, NULL);   // TOTK_ANOMALY
     void *sb, *db; uint64_t so, dof;
     if (!mtl_addr(src, n, &sb, &so) || !mtl_addr(dst, n, &db, &dof))
@@ -1642,7 +1739,7 @@ static void upd_flush(void) {
         for (; j < g_nupd && g_upd[j].lo <= hi; j++) if (g_upd[j].hi > hi) hi = g_upd[j].hi;   // merge overlapping / touching ranges
         void *db; uint64_t dof;
         if (!mtl_addr(lo, hi - lo, &db, &dof)) MDIE("renamed uniform update %#llx+%#llx is no longer in one memory pool", (unsigned long long)lo, (unsigned long long)(hi - lo));
-        usnap_drop(lo, hi - lo);   // TOTK: from here on the update is in memory (GPU timeline): later readers read it there
+        usnap_drop(lo, hi - lo, 1);   // TOTK: from here on the update is in memory (GPU timeline): later readers read it there
         id<MTLBuffer> sb; size_t so = arena_alloc((size_t)(hi - lo), &sb);
         pend_materialize(lo, (uint8_t *)sb.contents + so, (size_t)(hi - lo), 0);   // every byte here is covered by a logged update: the newest one wins
         if (!b) b = blit();
@@ -1682,6 +1779,7 @@ static uint64_t upd_shadow(uint64_t lo, uint64_t size) {
         return g_shadow[i].gpu;
     }
     id<MTLBuffer> sb; size_t so = arena_alloc((size_t)size, &sb);
+    gw_cpu_read(lo, size);   // diagnostic: built on the CPU
     pend_materialize(lo, (uint8_t *)sb.contents + so, (size_t)size, 0);
     uint64_t gpu = sb.gpuAddress + so;
     if (g_nshadow == UBO_SHADOW_MAX) g_nshadow = 0;
@@ -1707,7 +1805,7 @@ static void mtl_sub_update(const void *data, uint64_t dst, uint64_t n) {
         return;
     }
     if (ub_rename_on()) { g_ren_fallback++; upd_flush(); }   // pending table full: keep the order with a real copy
-    usnap_drop(dst, n);   // TOTK: the update reaches memory on the GPU timeline; later readers read it there
+    usnap_drop(dst, n, 1);   // TOTK: the update reaches memory on the GPU timeline; later readers read it there
     enc_b_copy_buffer(blit_buffer(sb, so, (__bridge id<MTLBuffer>)db, dof, n), sb, so, (__bridge id<MTLBuffer>)db, dof, n);
 }
 static void post(post_op o) {
@@ -2423,6 +2521,7 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "occl_visible")) { atomic_store(&g_occl_vis, v); MLOG("[flag] occl_visible = %d", v); return; }
     if (!strcmp(name, "drvfill")) { atomic_store(&g_drvfill_on, v != 0); MLOG("[flag] drvfill = %d", v != 0); return; }
     if (!strcmp(name, "ubo_snapshot")) { (void)usnap_on(); atomic_store(&g_usnap_on, v != 0); MLOG("[flag] ubo_snapshot = %d", v != 0); return; }
+    if (!strcmp(name, "usnap_split")) { (void)usnap_split_on(); atomic_store(&g_usnap_split, v ? 3 : 0); MLOG("[flag] usnap_split = %d", v != 0); return; }   // partial drops at once, the cut at the next submission
     MLOG("【红】unknown runtime flag %s", name);
 }
 /* TOTK diagnostic DM_NVN_TILELOG=WxH: every event on textures of that size (render, CPU texel read / write, invalidate,
@@ -7301,7 +7400,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             }
             void *mb; uint64_t mo, gpu;
             if (va && g_nupd && upd_overlap_seq(va, va + 65536)) { g_ren_late++; RED_ONCE(60, "uniform 槽里的存储缓冲指针 %#llx 在编码器打开后才发现与待写入的 uniform 更新重叠", (unsigned long long)va); }
-            if (va && b->rw) usnap_drop(va, 65536);   // TOTK: the shader may write there (extent unknown: 64 KiB as for the update check)
+            if (va && b->rw) usnap_drop(va, 65536, 0);   // TOTK: the shader may write there (extent unknown: 64 KiB as for the update check)
             if (va && mtl_gpu_addr(va, 1, &mb, &mo, &gpu)) { use_rec("buf", va, 1, 0, NULL); slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); }
             else { RED_ONCE(40, "阶段 %d uniform 槽 %d 偏移 %u 处的存储缓冲指针 %#llx 不在内存池里（uniform %s）", nvn_stage, reg, b->off, (unsigned long long)va, u && u->addr ? "已绑" : "未绑"); slots[aid] = dummy_buf_gpu(); USE(dummy_buf(), MTLResourceUsageRead);
                 /* TOTK diagnostic (first 12): which bound uniform block of this stage holds a pool pointer at this offset, and the head of every bound block */
@@ -7322,7 +7421,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
                 if (b->kind == NVN_RB_UBOP) ren = upd_shadow(u->addr, u->size);
                 else if (upd_overlap_seq(u->addr, u->addr + (u->size ? u->size : 1))) { g_ren_late++; RED_ONCE(59, "存储缓冲 %#llx 在编码器打开后才发现与待写入的 uniform 更新重叠", (unsigned long long)u->addr); }
             }
-            if (b->kind == NVN_RB_SBUFP && b->rw && u && u->addr) usnap_drop(u->addr, u->size ? u->size : 1);   // TOTK: the shader may write it: no stale uniform copy from here on
+            if (b->kind == NVN_RB_SBUFP && b->rw && u && u->addr) usnap_drop(u->addr, u->size ? u->size : 1, u->size != 0);   // TOTK: the shader may write it: no stale uniform copy from here on
             const usnap_t *usc = !ren && b->kind == NVN_RB_UBOP && u && u->addr ? usnap_find(u->addr, u->size ? u->size : 1) : NULL;   // TOTK: compute uniforms as of the submit call
             if (ren) { slots[aid] = ren; USE(dummy_buf(), MTLResourceUsageRead); }
             else if (usc) { slots[aid] = usc->gpu + (u->addr - usc->lo); USE(dummy_buf(), MTLResourceUsageRead); }
@@ -10571,7 +10670,7 @@ static int g_disp_probe_nobar;   // probe-gpu-dispatch-chain negative control: n
 static id<MTL4ComputeCommandEncoder> disp_enc(void) {
     int open = g_blit != nil;
     g_disp_n++; g_disp_shared += open;
-    if (!open) { rs_sync(); ser_gate(); pt_mark(g_cb, 'C', nil); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:bar_vis()]; }
+    if (!open) { rs_sync(); ser_gate(); pt_mark(g_cb, 'C', nil); g_blit = enc_b_begin(g_cb); if (!g_qbar_probe_off) [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:bar_vis()]; }
     else if (!g_disp_probe_nobar) [g_blit barrierAfterEncoderStages:MTLStageBlit | MTLStageDispatch beforeEncoderStages:MTLStageBlit | MTLStageDispatch visibilityOptions:bar_vis()];
     [g_blit setArgumentTable:g_ct]; args_dirty_all();
     if (g_disp_n % 20000 == 0) MLOG("[nvn] 计算派发 至 %llu 次：其中 %llu 次（%.0f%%）接在已开的计算编码器里，没有另开编码器", (unsigned long long)g_disp_n, (unsigned long long)g_disp_shared, 100.0 * (double)g_disp_shared / (double)g_disp_n);
@@ -10651,7 +10750,7 @@ static void dispatch(const p_dispatch *dp) {
     if (reuse) ce = disp_enc();
     else { if (g_blit) { enc_b_end(g_blit); g_blit = nil; } ce = pg_compute(); }
     enc_c_pso(ce, ps);
-    if (indirect) memcpy(g_dispatch_grid, (const void *)(uintptr_t)dp->caller, 12);
+    if (indirect) { gw_cpu_read(dp->caller, 12); memcpy(g_dispatch_grid, (const void *)(uintptr_t)dp->caller, 12); }
     else { g_dispatch_grid[0] = (uint32_t)dp->x; g_dispatch_grid[1] = (uint32_t)dp->y; g_dispatch_grid[2] = (uint32_t)dp->z; }
     if (passdump()) {   // pass dumps: the dispatch, its grid and the storage buffers it can write
         char b[600]; size_t o = 0;
@@ -10697,7 +10796,7 @@ static void copy_t2b(const p_copy_b2t *c) {
     void *mb; uint64_t mo;
     upd_guard(c->src, c->src + img * nz);   // TOTK: renamed uniform updates before a GPU write to the range
     if (!mtl_addr(c->src, img * nz, &mb, &mo)) { RED_ONCE(31, "贴图→缓冲拷贝的目标不在内存池里"); return; }
-    usnap_drop(c->src, img * nz);   // TOTK: a GPU write: no uniform copy of these bytes from here on
+    usnap_drop(c->src, img * nz, 1);   // TOTK: a GPU write: no uniform copy of these bytes from here on
     id<MTL4ComputeCommandEncoder> b = blit(); BOTW_T2B_NOTE(c, t, mb, mo, img * nz) BOTW_GPU_COPY_SUPERSEDES(mb, mo, img * nz)
     if (is3d)
         enc_b_copy_texture_buffer(b, t, 0, level, MTLOriginMake(c->r.xoffset, c->r.yoffset, c->r.zoffset), MTLSizeMake(c->r.width, c->r.height, nz), (__bridge id<MTLBuffer>)mb, mo, row, img);
@@ -13665,7 +13764,9 @@ int mtl_probe_ub_rename(void) {
    bind) and a pointer read (pend_read) must see the bytes of the submit call. A GPU buffer copy into the far range within
    the submission drops its copy: a later read sees the copied bytes. A range a writable storage buffer of the previous,
    still executing submission writes (held back by an event) is not copied: the read sees that write. Overlapping ranges
-   past the 1 MiB cap give disjoint, sorted copies that hold each binding whole or not at all.
+   past the 1 MiB cap give disjoint, sorted copies that hold each binding whole or not at all. Since 2026-10-25 a GPU write
+   (of this or of the executing submission) into part of a merged copy leaves only the written bytes live: the merged
+   neighbour keeps the bytes of the submit call (TOTK_USNAP_SPLIT=0: the whole merged copy goes live, as before).
    TOTK_PROBE_NEGATIVE=1 turns the snapshot off, =2 keeps copies after a GPU write, =3 forgets the previous submission's
    GPU writes; each must fail. */
 static size_t usp_bind(uint8_t *p, int st, int idx, uint64_t addr, uint64_t size) {
@@ -13703,7 +13804,7 @@ int mtl_probe_ubo_snapshot(void) {
     id<MTLLibrary> lib = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\nkernel void k(device const uchar *src [[buffer(0)]], device uchar *dst [[buffer(1)]], uint i [[thread_position_in_grid]]) { dst[i] = src[i]; }\n" options:nil error:&e];
     id<MTLComputePipelineState> ps = lib ? [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k"] error:&e] : nil;
     if (!ps) MDIE("ubo snapshot probe pipeline: %s", e.localizedDescription.UTF8String);
-    id<MTLBuffer> out = probe_buf(6 * 256), fill = probe_buf(256); memset(fill.contents, 0x77, 256);
+    id<MTLBuffer> out = probe_buf(8 * 256), fill = probe_buf(256); memset(fill.contents, 0x77, 256);
     const uint64_t m = (uint64_t)(uintptr_t)mem, a0 = m + 256, a1 = m + 512, a2 = m + 8192, src = m + 4096;
     uint64_t r1[32], r2[16]; uint8_t *p = (uint8_t *)r1;   // R1: bind a0, bind a1, call R2, end; R2: bind a2, end
     p += usp_bind(p, 1, 3, a0, 96); p += usp_bind(p, 0, 2, a1, 64);
@@ -13726,11 +13827,15 @@ int mtl_probe_ubo_snapshot(void) {
     usp_read(ps, a0, 96, out, 0); usp_read(ps, a1, 64, out, 256);
     mtl_sub_copy(src, a2, 128);   // a GPU write into a copied range: later readers must see it
     usp_read(ps, a2, 128, out, 512);
+    mtl_sub_copy(src, a0, 96);   // a GPU write into part of the merged copy: a0 must see it, a1 keeps the snapshot (memory is 0x45 now)
+    usp_read(ps, a0, 96, out, 1536); usp_read(ps, a1, 64, out, 1664);
     mtl_sub_commit(); mtl_finish();
     const uint8_t *o = out.contents;
     checked += usp_expect(o, 96, 0x11, "read of the first range (bytes of the submit call)");
     checked += usp_expect(o + 256, 64, 0x11, "read of the merged neighbour");
     checked += usp_expect(o + 512, 128, 0x66, "read after the GPU copy");
+    checked += usp_expect(o + 1536, 96, 0x66, "read after the GPU copy into part of the merged copy");
+    checked += usp_expect(o + 1664, 64, neg != 1 && (usnap_split_on() & 2) ? 0x11 : 0x45, "read of the merged neighbour after that copy");
     checked += usp_expect(mem + 8192, 128, 0x66, "memory after the GPU copy");
     if (g_nusnap != 0) MDIE("ubo snapshot probe: copies still listed after the commit"); checked++;
 
@@ -13739,7 +13844,7 @@ int mtl_probe_ubo_snapshot(void) {
     id<MTLSharedEvent> hold = [g_dev newSharedEvent]; hold.signaledValue = 0;
     mtl_sub_begin(); mtl_sub_snapshot_ubos(NULL, 0); mtl_exec((const uint8_t *)&end);
     { void *mb; uint64_t mo, gpu; if (!mtl_gpu_addr(a0, 96, &mb, &mo, &gpu)) MDIE("ubo snapshot probe: range not in the pool");
-      usnap_drop(a0, 96);   // as encode_args does for a writable storage-buffer binding
+      usnap_drop(a0, 96, 1);   // as encode_args does for a writable storage-buffer binding
       rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
       id<MTL4ComputeCommandEncoder> ce = enc_c_begin(NULL); enc_c_pso(ce, ps); enc_c_args(ce, fill.gpuAddress, 0); enc_c_args(ce, gpu, 1);
       [ce dispatchThreads:MTLSizeMake(96, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)]; enc_c_end(ce); }
@@ -13747,17 +13852,56 @@ int mtl_probe_ubo_snapshot(void) {
     uint64_t writer = mtl_sub_commit();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{ hold.signaledValue = 1; });   // release it even if something below waited
     if (neg == 3) g_ngw = 0;
-    uint64_t skip0 = g_usnap_skip_gpu;
+    uint64_t skip0 = g_usnap_skip_gpu, split0 = g_usnap_split_n; int sp = usnap_split_on() & 1;
     mtl_sub_begin(); mtl_sub_snapshot_ubos(h1, 1); mtl_exec((const uint8_t *)&end);
+    memset(mem + 512, 0x46, 64);   // the game rewrites the merged neighbour during the replay
     uint64_t done = __atomic_load_n(&g_done, __ATOMIC_ACQUIRE);
     if (done >= writer) MDIE("ubo snapshot probe: the held-back submission completed early (done %llu, writer %llu)", (unsigned long long)done, (unsigned long long)writer); checked++;
     if (neg != 3) {
-        if (usnap_find(a0, 96) || usnap_find(a1, 64) || !usnap_find(a2, 128) || g_usnap_skip_gpu != skip0 + 1) MDIE("ubo snapshot probe: the range of the executing GPU write was copied (or the far range was not)");
-        checked++;
+        if (usnap_find(a0, 96) || !usnap_find(a2, 128)) MDIE("ubo snapshot probe: the range of the executing GPU write was copied (or the far range was not)");
+        if ((usnap_find(a1, 64) != NULL) != sp || g_usnap_skip_gpu != skip0 + !sp || g_usnap_split_n != split0 + (uint64_t)sp)
+            MDIE("ubo snapshot probe: the merged neighbour of the executing GPU write %s (split %d, skipped %llu, cut %llu)", sp ? "was not copied" : "was copied", sp,
+                 (unsigned long long)(g_usnap_skip_gpu - skip0), (unsigned long long)(g_usnap_split_n - split0));
+        checked += 2;
     }
-    usp_read(ps, a0, 96, out, 768);
+    usp_read(ps, a0, 96, out, 768); usp_read(ps, a1, 64, out, 1408);
     mtl_sub_commit(); hold.signaledValue = 1; mtl_finish();
     checked += usp_expect(o + 768, 96, 0x77, "read of a range the previous submission's storage write produces");
+    if (neg != 3) checked += usp_expect(o + 1408, 64, sp ? 0x11 : 0x46, "read of the merged neighbour of that write");
+    /* 2b (2026-10-25). Unfinished writes stood in for in the write list (fence never reached): an exact write ending 4 bytes
+       into a merged range cuts it, and the piece keeps every binding's address alignment within 256 bytes (constant buffer
+       pointers); a write of unknown extent (a storage-buffer pointer, a binding without a size) skips its whole range.
+       Within the submission an exact write drops only its bytes, one of unknown extent the whole copy. */
+    if (neg != 1) {
+        const uint64_t b0 = m + 8192, b1 = m + 8448;   // second merged range [b0, b1+64) beside [a0, a1+64)
+        uint64_t rx[32]; uint8_t *q = (uint8_t *)rx;
+        q += usp_bind(q, 1, 3, a0, 96); q += usp_bind(q, 0, 2, a1, 64); q += usp_bind(q, 2, 1, b0, 128); q += usp_bind(q, 2, 2, b1, 64);
+        { op_hdr h = {OP_END, 8}; memcpy(q, &h, 8); }
+        const uint64_t hx[1] = {(uint64_t)(uintptr_t)rx};
+        g_ngw = 0;
+        g_gw[g_ngw++] = (gw_t){a0, a0 + 4, UINT64_MAX, 0}; g_gw[g_ngw++] = (gw_t){b0, b0 + 4, UINT64_MAX, 1};
+        uint64_t sk0 = g_usnap_skip_gpu, sx0 = g_usnap_skip_inexact, sc0 = g_usnap_split_n; int cut = usnap_split_on() & 1;
+        mtl_sub_begin(); mtl_sub_snapshot_ubos(hx, 1); mtl_exec((const uint8_t *)&end);
+        const usnap_t *c1 = usnap_find(a1, 64), *cb = usnap_find(b1, 64);
+        if (usnap_find(a0, 96) || cb || (c1 != NULL) != cut || g_usnap_split_n != sc0 + (uint64_t)cut || g_usnap_skip_gpu != sk0 + 1 + !cut || g_usnap_skip_inexact != sx0 + (uint64_t)cut)
+            MDIE("ubo snapshot probe: exact / unknown-extent writes: a1 %s, b1 %s, cut %llu, skipped %llu (%llu unknown extent)", c1 ? "copied" : "live", cb ? "copied" : "live",
+                 (unsigned long long)(g_usnap_split_n - sc0), (unsigned long long)(g_usnap_skip_gpu - sk0), (unsigned long long)(g_usnap_skip_inexact - sx0));
+        checked += 2;
+        if (c1) {
+            if (c1->lo != a0 + 4) MDIE("ubo snapshot probe: the cut piece starts at +%llu, expected +4", (unsigned long long)(c1->lo - a0));
+            uint64_t g = c1->gpu + (a1 - c1->lo); uintptr_t cp = (uintptr_t)(c1->cpu + (a1 - c1->lo));
+            if ((g & 255) != (a1 & 255) || (cp & 255) != (a1 & 255)) MDIE("ubo snapshot probe: binding in a cut piece at gpu %#llx / cpu %#llx, real address %#llx: alignment lost", (unsigned long long)g, (unsigned long long)cp, (unsigned long long)a1);
+            const uint64_t mid = a0 + 160;   // inside the piece, bound by nothing: shows what the copy still holds
+            if (!usnap_find(mid, 16)) MDIE("ubo snapshot probe: the cut piece does not hold its middle");
+            usnap_drop(a1, 8, 1);   // exact, within the submission: only those bytes
+            if (usnap_find(a1, 8) || (usnap_find(mid, 16) != NULL) != !!(usnap_split_on() & 2)) MDIE("ubo snapshot probe: an exact write within the submission dropped %s", usnap_find(a1, 8) ? "nothing" : "the whole copy");
+            usnap_drop(a1 + 56, 1, 0);   // unknown extent: the whole copy
+            if (usnap_find(mid, 16)) MDIE("ubo snapshot probe: a write of unknown extent within the submission left the copy in use");
+            checked += 4;
+        }
+        g_ngw = 0;   // the stand-in writes never complete
+        mtl_sub_commit(); mtl_finish();
+    }
 
     /* 3. overlapping ranges past the 1 MiB cap: copies stay disjoint, sorted, at most 1 MiB each; a binding is held whole by
        one copy or read from memory. 24 ranges of 64 KiB, 60 KiB apart: 0..16 fill the first copy exactly, 17 straddles it,
@@ -13801,7 +13945,7 @@ int mtl_probe_ubo_snapshot(void) {
         cap = mtl_sub_capture_ubos(h1, 1);
         mtl_sub_begin(); mtl_sub_snapshot_ubos(NULL, 0); mtl_exec((const uint8_t *)&end);   // the earlier submission, replayed after the capture
         { void *mb; uint64_t mo, gpu; if (!mtl_gpu_addr(a0, 96, &mb, &mo, &gpu)) MDIE("ubo snapshot probe: range not in the pool");
-          usnap_drop(a0, 96);
+          usnap_drop(a0, 96, 1);
           rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
           id<MTL4ComputeCommandEncoder> ce = enc_c_begin(NULL); enc_c_pso(ce, ps); enc_c_args(ce, fill.gpuAddress, 0); enc_c_args(ce, gpu, 1);
           [ce dispatchThreads:MTLSizeMake(96, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)]; enc_c_end(ce); }
@@ -14037,6 +14181,72 @@ int mtl_probe_dispatch_chain(void) {
     if (neg == 1) MLOG("dispatch-chain probe: without the barrier the values still came out right (the race did not show this time)");
     for (int k = 0; k < 2; k++) serial_put(pg[k].serial, nil);
     mtl_pool_del(s0); mtl_pool_del(s1); free(s0); free(s1); g_disp_probe_nobar = 0;
+    return checked;
+}
+
+/* TOTK probe (2026-10-25): GPU ordering across submissions. Submission A runs a slow kernel that writes s0 through a
+   writable storage binding and is committed without waiting; submission B binds s0 read-only and copies it to s1. A's
+   threads each run 2^20 steps and write only at the end. Each trial checks that B's replay saw A unfinished (otherwise it
+   proves nothing and is counted as inconclusive) and that s1 holds A's values: the queue barriers every replay encoder
+   ends / the shared compute encoder starts with (m4_end, disp_enc) order the two command buffers on the GPU, without any
+   CPU wait. TOTK_PROBE_NEGATIVE=2 drops those barriers: B reads stale bytes, so the probe must fail (it sees the race).
+   This is why a CPU-side race, not a GPU-side one, was left for the acquire sync (hle_nvn.c, TOTK_ACQ_SYNC). */
+int mtl_probe_gpu_order(void) {
+    mtl_init(); int checked = 0;
+    const char *ne = getenv("TOTK_PROBE_NEGATIVE"); int neg = ne ? atoi(ne) : 0; g_qbar_probe_off = neg == 2;
+    static const char *head = "#include <metal_stdlib>\nusing namespace metal;\nstruct _23 { uint _m0[1]; };\n"
+        "struct spvDescriptorSetBuffer0 { device _23* cp_s0 [[id(0)]]; device _23* cp_s1 [[id(1)]]; };\n"
+        "kernel void main0(constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]], uint3 g [[thread_position_in_grid]])\n{\n    uint i = g.x;\n";
+    const char *body[2] = {"    uint v = i;\n    for (uint k = 0u; k < 1048576u; k++) v = v * 1664525u + 1013904223u;\n    (*spvDescriptorSet0.cp_s0)._m0[i] = v;\n}\n",
+                           "    (*spvDescriptorSet0.cp_s1)._m0[i] = (*spvDescriptorSet0.cp_s0)._m0[i];\n}\n"};
+    NvProg *pr[2]; prog_t pg[2] = {{0}, {0}};
+    for (int k = 0; k < 2; k++) {
+        NSError *e = nil; NSString *msl = [NSString stringWithFormat:@"%s%s", head, body[k]];
+        id<MTLLibrary> lib = totk_msl_library(msl, &e);
+        if (!lib) MDIE("gpu-order probe: kernel %d does not compile: %s", k, e.localizedDescription.UTF8String);
+        NvShader *cs = [NvShader new]; cs->fn = [lib newFunctionWithName:@"main0"]; cs->stage = 5; cs->src = msl;
+        snprintf(cs->key, sizeof cs->key, "probe-gpu-order-%d", k);
+        cs->rf.nb = 2; for (int b = 0; b < 2; b++) { cs->rf.b[b].kind = NVN_RB_SBUFP; cs->rf.b[b].aid = b; cs->rf.b[b].reg = b; cs->rf.b[b].rw = k == 0 ? b == 0 : b == 1; }
+        cs->rf.tg[0] = 64; cs->rf.tg[1] = 1; cs->rf.tg[2] = 1;
+        cs->ae = [cs->fn newArgumentEncoderWithBufferIndex:0]; cs->arg_len = cs->ae.encodedLength;
+        pr[k] = [NvProg new]; pr[k]->sh[5] = cs; pg[k].serial = 0xfffffd20 + (uint64_t)k; serial_put(pg[k].serial, pr[k]);
+    }
+    enum { N = 1 << 14, T = 8 };   // few threads, each long: every thread of A writes at its very end, so B started early reads zeros
+    const size_t SZ = (size_t)N * 4; uint32_t *s0 = NULL, *s1 = NULL, *want = malloc(SZ);
+    if (posix_memalign((void **)&s0, 16384, SZ) || posix_memalign((void **)&s1, 16384, SZ) || !s0 || !s1 || !want) MDIE("gpu-order probe memory");
+    uint32_t ja = 1, jc = 0;   // 2^20 steps of v -> v*1664525+1013904223 composed: v -> v*ja + jc
+    { uint32_t a = 1664525u, c = 1013904223u; for (int b = 0; b < 20; b++) { c = c * a + c; a = a * a; } ja = a; jc = c; }
+    for (uint32_t i = 0; i < N; i++) want[i] = i * ja + jc;
+    mtl_pool_add(s0, SZ); mtl_pool_add(s1, SZ);
+    op_hdr end = {OP_END, 8}; const prog_t *saved = S.prog;
+    int raced = 0, idle = 0, bad_trials = 0; uint64_t bad_total = 0;
+    for (int t = 0; t < T; t++) {
+        memset(s0, 0, SZ); memset(s1, 0xab, SZ);
+        uint64_t fa = 0;
+        for (int k = 0; k < 2; k++) {   // k = 0: submission A (writer), 1: submission B (reader)
+            mtl_sub_begin(); mtl_sub_snapshot_ubos(NULL, 0); mtl_exec((const uint8_t *)&end);
+            if (k == 1 && __atomic_load_n(&g_done, __ATOMIC_ACQUIRE) >= fa) idle++;   // A already finished: this trial cannot show anything
+            memset(&S.ssbo, 0, sizeof S.ssbo);
+            S.ssbo[5][0] = (p_bind_buf){5, 0, (uint64_t)(uintptr_t)s0, SZ}; S.ssbo[5][1] = (p_bind_buf){5, 1, (uint64_t)(uintptr_t)s1, SZ};
+            rp_end(); blit_close();
+            S.prog = &pg[k]; p_dispatch dp = {N / 64, 1, 1, 0}; dispatch(&dp); S.prog = saved;
+            uint64_t f = mtl_sub_commit(); memset(&S.ssbo, 0, sizeof S.ssbo);
+            if (!k) fa = f;
+        }
+        mtl_finish();
+        uint64_t bad = 0, first = N;
+        for (uint32_t i = 0; i < N; i++) if (s1[i] != want[i]) { if (!bad++) first = i; }
+        if (s0[0] != want[0] || s0[N - 1] != want[N - 1]) MDIE("gpu-order probe: the writer kernel itself computed wrong values");
+        if (bad) { bad_trials++; bad_total += bad; raced++; MLOG("gpu-order probe trial %d: %llu of %d words read before A's write landed (first %llu: %#x, expected %#x)", t, (unsigned long long)bad, N, (unsigned long long)first, s1[first], want[first]); }
+    }
+    checked += 2;
+    MLOG("gpu-order probe: %d trials, %d with A already finished at B's replay, %d with stale reads (%llu words); queue barriers %s", T, idle, bad_trials, (unsigned long long)bad_total, g_qbar_probe_off ? "off" : "on");
+    if (idle == T) MDIE("gpu-order probe: A had always finished before B was replayed; the writer kernel is too fast to test anything");
+    if (raced) MDIE("gpu-order probe%s: B read stale bytes in %d of %d trials", g_qbar_probe_off ? " (no queue barriers: expected)" : "", raced, T);
+    checked++;
+    if (g_qbar_probe_off) MLOG("gpu-order probe: no queue barriers and still no stale read (the race did not show)");
+    for (int k = 0; k < 2; k++) serial_put(pg[k].serial, nil);
+    mtl_pool_del(s0); mtl_pool_del(s1); free(s0); free(s1); free(want); g_qbar_probe_off = 0;
     return checked;
 }
 
@@ -14322,7 +14532,7 @@ int mtl_probe_arg_epoch(void) {
         for (int stripe = 0; stripe < 4; stripe++) {
             int shader = stripe == 1 ? 1 : 0;
             p_bind_program program = {&programs[shader],0x1f}; state_op(OP_BIND_PROGRAM,&program);
-            if (stripe == 2) usnap_drop(u.addr,16);
+            if (stripe == 2) usnap_drop(u.addr,16, 1);
             if (mode && negative == 19 && stripe == 2) shaders[0]->ab_epoch.snapshot_drops = g_usnap_drops;
             enc_r_pso(en,pipelines[shader]); enc_r_scissor(en,(MTLScissorRect){stripe*8,0,8,8});
             encode_args((id<MTLCommandEncoder>)en,shaders[shader],1,0); enc_r_draw(en,MTLPrimitiveTypeTriangle,0,3);

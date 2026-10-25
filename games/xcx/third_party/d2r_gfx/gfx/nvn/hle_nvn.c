@@ -123,6 +123,7 @@ HLE_FORCE("nvnBootstrapLoader", "NVN 图形接口整块换成宿主空设备（�
 
 #include "nvn_obj.h"
 #include "totk_timeline.h"
+#include "acq_fence.h"
 void mtl_args_stats(uint64_t *enc, uint64_t *reuse);
 
 // ---------- 设备 ----------
@@ -636,6 +637,10 @@ NVN(nvnCommandBufferFenceSync, void, NVNcommandBuffer *c, NVNsync *s, NVNsyncCon
 // TOTK_SYNC_LOG=1: CPU waits by kind (0 fence sync, 1 window-acquire sync): calls, calls that had to block, blocked time,
 // and calls whose fence was the newest committed one (a full drain of the queue).
 _Atomic uint64_t g_sw_calls[2], g_sw_blocked[2], g_sw_ns[2], g_sw_newest[2];
+// TOTK_ACQ_SYNC 统计（总开，见 nvnWindowAcquireTexture）：取图次数、挂了栅栏的、CPU 在取图同步上真的等的次数 / 时间 / 最长一次
+// TOTK_ACQ_SYNC stats (always on, see nvnWindowAcquireTexture): acquires, those given a fence, CPU waits on an acquire sync that blocked / their time / the longest
+// 只算带超时的等待（超时 0 = 轮询，不算 CPU 等）；等到超时的另计 | only waits with a timeout (timeout 0 = a poll, not a CPU wait); those that timed out counted apart
+static _Atomic uint64_t g_acq_n, g_acq_fenced, g_acq_blk, g_acq_blk_ns, g_acq_blk_max, g_acq_blk_to;
 static int synclog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK_SYNC_LOG") != NULL; return on; }
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     NVN_BLOCKING();
@@ -648,9 +653,12 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     uint64_t t0 = lg ? now_ns() : 0;
     totk_tl(TL_WAIT_IN, o->fence, o->fence == mtl_last_fence());
     if (sync_chain_left(1)) { char w[96]; snprintf(w, sizeof w, "SyncWait sync=%p fence=%llu newest=%d", (const void *)s, (unsigned long long)o->fence, o->fence == mtl_last_fence()); guest_chain(w); }
+    uint64_t ta = k && timeout ? now_ns() : 0;
     int ok = tok ? fence_wait(o->fence, timeout) : mtl_wait(o->fence, timeout);
     totk_tl(TL_WAIT_OUT, o->fence, ok);
     if (lg) { atomic_fetch_add(&g_sw_blocked[k], 1); atomic_fetch_add(&g_sw_ns[k], now_ns() - t0); }
+    if (k && timeout) { uint64_t d = now_ns() - ta, m = atomic_load(&g_acq_blk_max); atomic_fetch_add(&g_acq_blk, 1); atomic_fetch_add(&g_acq_blk_ns, d); if (!ok) atomic_fetch_add(&g_acq_blk_to, 1);
+             while (d > m && !atomic_compare_exchange_weak(&g_acq_blk_max, &m, d)) {} }
     return ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
 }
 NVN(nvnEventBuilderSetDefaults, void, NVNeventBuilder *b) { memset(b, 0, sizeof(ev_builder_t)); }
@@ -2341,6 +2349,7 @@ NVN(nvnWindowInitialize, NVNboolean, NVNwindow *w, const NVNwindowBuilder *b) {
     memset(o, 0, sizeof *o); o->magic = MAGIC('W', 'I', 'N', 'D'); o->native = s->native; o->ntex = s->ntex; o->interval = s->interval; o->active=s->active?s->active:s->ntex;
     if(o->ntex<2||o->ntex>4||o->active<2||o->active>o->ntex)return 0;
     memcpy(o->tex, s->tex, sizeof o->tex);
+    { void acq_window_reset(const win_t *); acq_window_reset(o); }   // TOTK_ACQ_SYNC: earlier presents of this storage do not count
     for (int i = 0; i < o->ntex; i++) if (o->tex[i]) mtl_xv_window_tex(CTX(o->tex[i])->serial);
     LOG("[nvn] WindowInitialize 交换链 %d 张 间隔 %d 首张 %dx%d 格式 %#x", o->ntex, o->interval,
         o->ntex ? (int)CTX(o->tex[0])->d.width : 0, o->ntex ? (int)CTX(o->tex[0])->d.height : 0, o->ntex ? CTX(o->tex[0])->d.format : 0);
@@ -2431,6 +2440,48 @@ uint64_t g_frame_pub;
 static uint64_t g_acq_wait_ns, g_pq_wait_ns;   // 取图里节拍等待 / 等出图队列归还的累计，出图时按帧记（一帧内可有多次取图） | Accumulated display-link wait / wait for the present queue to return inside acquire, recorded per frame at present (there can be several acquires within one frame)
 uint64_t dm_nvn_frame_count(void) { return g_frame; }
 extern uint64_t g_t0_ns;   // 宿主进程起点（main.c；UIMSG 时间戳同基） | Host process start point (main.c; same base as the UIMSG timestamps)
+/* TOTK_ACQ_SYNC (2026-10-25)：取图同步挂什么栅栏。缺省 next = 把这张换下屏幕的下一次出图时最新的提交（真机语义：显示在翻到下一张时
+   才释放这张，而翻屏要等下一张那一帧的 GPU 工作做完；Xenoblade X 的交换链是 2 张，这一档就等于已验证不闪的 old）；tex = 这张贴图
+   自己上一次出图那一帧（比真机早一帧放行，帧之间多叠一帧；试验用，以后再试）；old = 取图时最新的提交（等上一帧全部做完，D2R 原行为）；
+   now = 立即放行（TotK 的优化，Xenoblade X 上闪坏帧）。没有记录（刚开始、窗口重新初始化、别的窗口）时用最新的提交，不立即放行。
+   记的都是已经发出的提交，等待一定会结束。
+   TOTK_ACQ_SYNC (2026-10-25): the fence of the acquire sync. Default, next: the newest submission at the present after
+   this image's last one, the present that replaced it on screen. That is the real hardware: the display releases an image
+   only at the flip to the next one, and that flip needs the next frame's GPU work done, so the acquire sync of frame N+2's
+   image signals after frame N+1's work. With Xenoblade X's 2 images this equals old, the mode proven free of the flicker.
+   tex: the frame of this image's own last present (one frame earlier than the hardware: one more frame of overlap;
+   experimental, to try later). old: the newest submission at the acquire (the whole previous frame; the D2R behaviour).
+   now: done at once (the TotK optimisation; flickering garbage frames in Xenoblade X). Without a record (first frames, a
+   window initialised again (acq_window_reset), another window) the newest submission, never "done at once": earlier
+   frames may still be in flight. Every value recorded is a submission already made (a committed Metal fence, or a
+   translation-thread token fence_wait resolves), so a wait on it always ends. Presents with a MetalFX frame-interpolation
+   or a discarded (ticket 0) present path are recorded the same way: the fence is about the game's submissions. */
+static acq_track g_acq; static pthread_mutex_t g_acq_mu = PTHREAD_MUTEX_INITIALIZER;
+static int acq_mode(void) {
+    static int m = -1;
+    if (m < 0) { const char *e = getenv("TOTK_ACQ_SYNC");
+        m = e && !strcmp(e, "old") ? ACQ_OLD : e && !strcmp(e, "now") ? ACQ_NOW : e && !strcmp(e, "tex") ? ACQ_TEX : ACQ_NEXT;
+        LOG("[nvn] 取图同步：%s", m == ACQ_NEXT ? "等把这张换下屏幕的那一帧的 GPU 工作（缺省，与真机一致；TOTK_ACQ_SYNC=tex / old / now 换）" :
+                                 m == ACQ_TEX ? "等这张贴图上一次出图那一帧的 GPU 工作（TOTK_ACQ_SYNC=tex，试验：比真机早一帧放行）" :
+                                 m == ACQ_OLD ? "等取图时最新的提交（TOTK_ACQ_SYNC=old，等上一帧全部做完）" : "立即放行（TOTK_ACQ_SYNC=now，旧的 TotK 行为）"); }
+    return m;
+}
+void acq_window_reset(const win_t *o) { pthread_mutex_lock(&g_acq_mu); acq_reset(&g_acq, o); pthread_mutex_unlock(&g_acq_mu); }
+static void acq_note(const win_t *o, int idx) {   // nvnQueuePresentTexture, after the frame's submits were made (enqueued)
+    int tok; uint64_t v = fence_now(&tok);
+    pthread_mutex_lock(&g_acq_mu); acq_note_present(&g_acq, o, idx, v, tok); pthread_mutex_unlock(&g_acq_mu);
+}
+static uint64_t acq_fence_for(const win_t *o, int idx, int m, int *tok) {
+    int r = 0; uint64_t v = 0; *tok = 0;
+    if (m == ACQ_TEX || m == ACQ_NEXT) { pthread_mutex_lock(&g_acq_mu); r = acq_pick(&g_acq, o, idx, m, &v, tok); pthread_mutex_unlock(&g_acq_mu); }
+    if (m == ACQ_OLD || r < 0) v = fence_now(tok);
+    return v;
+}
+static uint64_t acq_sync_fence(const win_t *o, int idx, int *tok) {
+    uint64_t v = acq_fence_for(o, idx, acq_mode(), tok);
+    atomic_fetch_add(&g_acq_n, 1); if (v) atomic_fetch_add(&g_acq_fenced, 1);
+    return v;
+}
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
     NVN_BLOCKING();
     totk_tl(TL_ACQ_IN, 0, 0);
@@ -2458,16 +2509,67 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     if (async_replay() && *idx < 4 && g_xp_win == o) x_wait_job(g_xp_job[*idx]);   // TOTK: that image's last present has run (its ticket is set)
     uint64_t tk = *idx < 4 ? o->ticket[*idx] : 0;
     if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); g_pq_wait_ns += now_ns() - w0; }
-    /* TOTK: the acquire sync means "this swapchain texture is no longer read by the display path". mtl_present_wait above
-       already waited until the GPU finished the present copy that last read this texture, and every later use of it is
-       ordered after that copy on the one Metal queue. Fencing the sync to the newest submission instead (the D2R behaviour,
-       TOTK_ACQ_SYNC=old) made the game's CPU wait for the whole previous frame here, so replay and GPU of consecutive
-       frames never overlapped and the GPU idled between frames. Bit 1 of fenced marks acquire syncs for TOTK_SYNC_LOG. */
-    if (s) { static int old_sync = -1; if (old_sync < 0) { const char *e = getenv("TOTK_ACQ_SYNC"); old_sync = e && !strcmp(e, "old"); }
-             int tok = 0; uint64_t v = old_sync ? fence_now(&tok) : 0;
+    /* TOTK: the acquire sync. mtl_present_wait above already waited until the GPU was handed the present copy that last read
+       this texture, and every later GPU use of it is ordered after that copy on the one Metal queue; but the game also waits
+       on this sync on the CPU before it rewrites per-frame memory its earlier frames' GPU work still reads (Xenoblade X,
+       2026-10-25: single-frame scene corruption at 60 fps with the sync signalled at once, gone with TOTK_ACQ_SYNC=old or
+       DM_EXP_SUBMIT_WAIT=1; the GPU queue itself was shown ordered, probe-gpu-order). So the sync is fenced to the
+       submissions that last used this image: acq_sync_fence. Bit 1 of fenced marks acquire syncs (TOTK_SYNC_LOG, stats). */
+    if (s) { int tok = 0; uint64_t v = acq_sync_fence(o, *idx, &tok);
              ((sync_t *)s)->fenced = tok ? 7 : 3; ((sync_t *)s)->fence = v; }
     totk_tl(TL_ACQ_OUT, (uint64_t)*idx, 0);
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
+}
+/* TOTK probe (2026-10-25), probe-gpu-acq-sync: the acquire-sync fence (TOTK_ACQ_SYNC) through the production bookkeeping
+   (acq_note at the present, acq_fence_for at the acquire) and real, empty submissions (submit_exec, Metal fences). Frame 1
+   draws image 0, frame 2 image 1, frame 3 submits work before its acquire: image 0's sync must wait for frame 2's fence
+   (next, the default), frame 1's (tex), frame 3's (old) or nothing (now); image 1 in next mode is still on screen and
+   takes the newest. A never-presented image, a window initialised again and another window take the newest submission
+   (never "no wait"). The sync then completes through nvnSyncWait, a fence no submission has reached yet times out (never
+   signalled early; counted, also as a timeout), a poll (timeout 0) is not counted, and past ACQ_RING presents the oldest
+   kept (later) fence stands in. Synchronous replay only (fence values; tokens go through fence_wait). */
+int nvn_probe_acq_sync(void) {
+    if (async_replay()) die("acq-sync probe: run without TOTK_ASYNC_REPLAY (it checks Metal fence values)");
+    int checked = 0, tok = 0; static win_t wa, wb; const win_t *a = &wa, *b = &wb;
+    acq_window_reset(a);
+    submit_exec(0, NULL, NULL);   // earlier work in flight: a fence above 0, so "the newest" and "no wait" differ
+    uint64_t f0 = mtl_last_fence(), f[4] = {f0, 0, 0, 0};
+    if (!f0) die("acq-sync probe: the first submission made no fence");
+    for (int m = ACQ_NOW; m <= ACQ_NEXT; m++) if (acq_fence_for(a, 0, m, &tok) != (m == ACQ_NOW ? 0 : f0)) die("acq-sync probe: never-presented image, mode %d", m);
+    checked++;
+    for (int k = 1; k <= 3; k++) { submit_exec(0, NULL, NULL); f[k] = mtl_last_fence(); if (f[k] <= f[k - 1]) die("acq-sync probe: submission %d made no new fence", k); if (k < 3) acq_note(a, k - 1); }
+    const uint64_t want0[4] = {[ACQ_NOW] = 0, [ACQ_OLD] = f[3], [ACQ_TEX] = f[1], [ACQ_NEXT] = f[2]}, want1[4] = {[ACQ_NOW] = 0, [ACQ_OLD] = f[3], [ACQ_TEX] = f[2], [ACQ_NEXT] = f[3]};
+    for (int m = ACQ_NOW; m <= ACQ_NEXT; m++) {
+        uint64_t v0 = acq_fence_for(a, 0, m, &tok), v1 = acq_fence_for(a, 1, m, &tok);
+        if (v0 != want0[m] || v1 != want1[m] || tok) die("acq-sync probe: mode %d: image 0 -> %llu (want %llu), image 1 -> %llu (want %llu)", m, (unsigned long long)v0, (unsigned long long)want0[m], (unsigned long long)v1, (unsigned long long)want1[m]);
+        checked++;
+    }
+    sync_t sy = {MAGIC('S', 'Y', 'N', 'C'), 3, acq_fence_for(a, 0, ACQ_TEX, &tok)};
+    uint64_t blk0 = atomic_load(&g_acq_blk), to0 = atomic_load(&g_acq_blk_to);
+    NVNsyncWaitResult r = h_nvnSyncWait((NVNsync *)&sy, 5000000000ull);
+    if ((r != NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED && r != NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED) || !mtl_wait(f[1], 0)) die("acq-sync probe: the sync of frame 1's fence did not complete (result %d)", (int)r);
+    checked++;
+    sync_t early = {MAGIC('S', 'Y', 'N', 'C'), 3, mtl_last_fence() + 1};
+    if (h_nvnSyncWait((NVNsync *)&early, 50000000ull) != NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED) die("acq-sync probe: a sync on a fence no submission reached was signalled");
+    if (atomic_load(&g_acq_blk) <= blk0 || atomic_load(&g_acq_blk_to) != to0 + 1) die("acq-sync probe: the blocked acquire-sync wait / its timeout was not counted");
+    uint64_t blk1 = atomic_load(&g_acq_blk);
+    if (h_nvnSyncWait((NVNsync *)&early, 0) != NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED || atomic_load(&g_acq_blk) != blk1) die("acq-sync probe: a poll (timeout 0) was counted as a CPU wait");
+    checked += 3;
+    uint64_t fn = mtl_last_fence();
+    if (acq_fence_for(b, 0, ACQ_TEX, &tok) != fn || acq_fence_for(b, 0, ACQ_NEXT, &tok) != fn) die("acq-sync probe: another window did not take the newest submission");
+    acq_window_reset(a);
+    if (acq_fence_for(a, 0, ACQ_TEX, &tok) != fn || acq_fence_for(a, 1, ACQ_NEXT, &tok) != fn) die("acq-sync probe: a window initialised again did not take the newest submission");
+    checked += 2;
+    submit_exec(0, NULL, NULL); uint64_t fp = mtl_last_fence(); acq_note(a, 0);
+    uint64_t fk[ACQ_RING + 4];
+    for (int k = 0; k < ACQ_RING + 4; k++) { submit_exec(0, NULL, NULL); fk[k] = mtl_last_fence(); acq_note(a, 1); }
+    uint64_t v = acq_fence_for(a, 0, ACQ_TEX, &tok);   // 21 presents later: the oldest of the 16 kept (present 6, image 1's fifth)
+    if (v != fk[4] || v <= fp) die("acq-sync probe: past the ring: %llu, want %llu (> %llu)", (unsigned long long)v, (unsigned long long)fk[4], (unsigned long long)fp);
+    if (!mtl_wait(v, 5000000000ull)) die("acq-sync probe: the stand-in fence did not complete");
+    checked += 2;
+    acq_window_reset(NULL);
+    LOG("[acq-sync] %d checks passed (fences %llu..%llu)", checked, (unsigned long long)f0, (unsigned long long)mtl_last_fence());
+    return checked;
 }
 #ifdef GAME_BOTW
 /* NVN 53 (Breath of the Wild 1.6.0, botw.md): the queue-side acquire. The same wait as nvnWindowAcquireTexture without a
@@ -2562,7 +2664,10 @@ static void tsummary(uint64_t frame) {
     LOG("[nvn] 计时 至帧 %llu：%s", frame, line);
     { unsigned n = g_tn[0] < TWIN ? g_tn[0] : TWIN, over = 0; double v[TWIN];   // 帧间隔另起一行（M1 基线）：本窗口 > 16.7 ms 帧数与 p99 | frame interval gets its own line (M1 baseline): number of frames > 16.7 ms in this window and p99
       if (n) { memcpy(v, g_tw[0], n * sizeof *v); qsort(v, n, sizeof *v, dcmp); for (unsigned i = 0; i < n; i++) over += v[i] > 16.7;
-        LOG("[nvn] 帧间隔 至帧 %llu：>16.7ms %u / %u 帧，p99 %.2f ms", frame, over, n, v[(n * 99) / 100 < n ? (n * 99) / 100 : n - 1]); } }
+        static uint64_t pa, pfz, pb, pbn, pto; uint64_t an = atomic_load(&g_acq_n), af = atomic_load(&g_acq_fenced), ab = atomic_load(&g_acq_blk), abn = atomic_load(&g_acq_blk_ns), amx = atomic_exchange(&g_acq_blk_max, 0), ato = atomic_load(&g_acq_blk_to);
+        LOG("[nvn] 帧间隔 至帧 %llu：>16.7ms %u / %u 帧，p99 %.2f ms；取图 %llu 次，挂栅栏 %llu 次，CPU 等取图同步 %llu 次（其中超时 %llu）/ 平均 %.3f / 最长 %.3f ms", frame, over, n, v[(n * 99) / 100 < n ? (n * 99) / 100 : n - 1],
+            (unsigned long long)(an - pa), (unsigned long long)(af - pfz), (unsigned long long)(ab - pb), (unsigned long long)(ato - pto), ab > pb ? (double)(abn - pbn) / (double)(ab - pb) / 1e6 : 0.0, (double)amx / 1e6);
+        pa = an; pfz = af; pb = ab; pbn = abn; pto = ato; } }
     { unsigned n = g_presn < TWIN ? g_presn : TWIN, k = 0, drop = 0, discard = 0; double v[TWIN];   // 上屏：掉帧 = 间隔 > 16.7 × 1.5 ms 或被丢弃 | on-screen present: dropped frame = interval > 16.7 × 1.5 ms or discarded
       for (unsigned i = 0; i < n; i++) { double x = g_pres_iv[i]; if (x < 0) { drop++; discard++; } else if (x > 0) { v[k++] = x; drop += x > 25.0; } }
       task_vm_info_data_t vi; mach_msg_type_number_t vc = TASK_VM_INFO_COUNT; double fp = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &vc) == KERN_SUCCESS ? vi.phys_footprint / 1048576.0 : -1;
@@ -2848,6 +2953,7 @@ static void present_exec(win_t *o, int idx, double period, const int crop[4], ui
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     NVN_BLOCKING();
     (void)q; win_t *o = (win_t *)w; o->presents++;
+    acq_note(o, idx);   // TOTK_ACQ_SYNC: this image is drawn by the submissions made so far
     totk_tl_frame(o->presents); totk_tl(TL_PRES_IN, (uint64_t)idx, 0);
     if (runtime_frame_step_update) runtime_frame_step_update(now_ns());
     if (movie_host_tick) movie_host_tick();

@@ -1355,3 +1355,80 @@ original MacNativeGames project, and the entries above, are unchanged.
   faked devicectl); the launcher's `move_folder` in a harness on temporary folders (the same four cases, and a fake
   `xcx-native-v101` process detected); `make launcher` with `-Werror` for both versions; the window compiled with
   build_app.py's `swiftc` command; `make runtime`. Not run against the owner's Library or a device.
+
+### 2026-10-25: 60 fps: the timed B-button prompt
+
+**Found** (static analysis of main 2.0.0 with capstone; session notes `fps60-investigation.md`, Bug 2): with the 60 fps
+patch the timed B-button prompt (the "Soul Challenge") ran twice as fast. It is a HUD class (constructor main+0x5c56c4,
+panes `mc_ShrinkRing`, `mc_JudgeRing`, `mc_Perfect` ...). It reads the ring's lifetime N in 30 fps frames from BDAT
+`BTL_BtnChallengeLv` (murmur3 0x52f917eb at main+0x5c5c08; byte column 0x25efa387, rows 1..5) and keeps speed = 30/N
+(+0x138[level], copied to +0x120 at the start). The ring (+0x11c) starts at 30.0 and the update (main+0x5c6208, called
+every frame from main+0x7877f8) takes speed off it each frame (main+0x5c6280 `ldr s1, [x19, #0x120]`, then `fsub`);
+below 0 the prompt fails. The judge on B (main+0x5c64c0, a leaf) checks ring + speed (main+0x5c64fc `ldr s1, [x0,
+#0x120]`, then `fadd`): Perfect for 6.9..12, Good for 0..6.9 and 12..15, else Failed. Neither reads GetFrameTime, so the
+ring lasted N frames: N/30 s as shipped, N/60 s at 60 fps. The ring picture follows the same value.
+
+**The patch** (`runtime/game_patches.c`, sites 3 and 4 of `60fps`, written by `apply_fps60` with the other two; each word
+checked first, a mismatch stops the start):
+
+| Site (2.0.0 / 1.0.1) | Original | Patched |
+|---|---|---|
+| ring step, +0x5c6280 / +0x5c5870 | `bd412261` ldr s1, [x19, #0x120] (the words before and after checked) | `b` veneer 3 |
+| judge, +0x5c64fc / +0x5c5aec | `bd412001` ldr s1, [x0, #0x120] (checked likewise) | `b` veneer 4 |
+| veneers 3 and 4, +0x1735080 / +0x1744dc0 (84 bytes, after veneers 1 and 2) | zero padding (checked) | `ldr s1, [xN, #0x120]; adrp x16, page; ldr w17, [x16, #8]; cbz w17, 1f; ldr s2, [x16]; fmul s1, s1, s2; fmov s2, #30.0; fmul s1, s1, s2; 1: b site+4` |
+
+In mode 1 the step becomes speed x frame time x 30, so the ring lasts N/30 s at any frame rate, and the judge's window,
+which is in ring units, keeps its length in time. Mode 0 (30 fps, `XCX_FPS60=0`, iOS "30") runs the shipped step.
+x16, x17 and s2 are not used by the update or the judge before they are written. 1.0.1: the class's whole code
+(main+0x5c56c4..0x5c6560 in 2.0.0) is the same 0xa10 bytes earlier, instruction for instruction except PC-relative
+operands (adrp/add/bl), and its update is called from main+0x798008. The frame-counted sound cue of the same class
+(+0x114, `subs #1`) still counts frames; at 60 fps it plays earlier.
+
+New log line, after the patch's line: `[xcx] game patch 60fps (2.0.0): timed B-button prompt on (step x frame time x 30);
+ring step main+0x5c6280, judge main+0x5c64fc, veneers main+0x1735080..+0x17350d4`. iOS: build_ipa.py's export now
+reports `main ... patched_words=32` (was 12).
+
+**Checked:** `scripts/verify_fps60_qte_patch.py` (new; Unicorn on `rewritten/<v>/main.patched.bin`, words parsed from
+game_patches.c) for 2.0.0 and 1.0.1: N = 20, 30, 45, 60; shipped at 30 fps the ring runs out after N (or N + 1, a ring of
+exactly 0.0) frames; shipped at 60 fps in half the time (negative control); patched in mode 0 equals the shipped code
+bit for bit at 30 and 60 fps; patched at 20, 30, 45, 60 and 120 fps the ring runs out within one 30 fps frame plus one
+frame of the reference, and a press at any millisecond gets the reference verdict except within one 30 fps frame plus
+one frame of a window edge. `--exported` against the text the runtime wrote (`export-ios`, both versions,
+`XCX_PATCHES=60fps XCX_FPS60=1`): the 20 words match. `tests/test_fps60_qte_patch.py` (encodings, sites, padding);
+`make runtime` for both versions. **Not checked in the game**: the ring's speed and the Perfect/Good window at 60 fps
+against 30 still need a play test (start a Soul Challenge at both rates and time the ring).
+
+### 2026-10-25: acquire sync fenced like real NVN (single-frame flicker at 60 fps)
+
+**Found** (owner's A/B play test, 60 fps, New Los Angeles hangar): flickering garbage frames by default, little to none
+with `TOTK_ACQ_SYNC=old`, none with `DM_EXP_SUBMIT_WAIT=1`. `nvnWindowAcquireTexture` marked the acquire sync done at
+once (a TotK optimisation: the present copy is already ordered on the one Metal queue). Xenoblade X waits on that sync on
+the CPU before it rewrites per-frame memory, so it overwrote data an earlier frame's GPU work still read. A GPU-to-GPU
+hazard was ruled out: `probe-gpu-order` shows the encoders' queue barriers order submissions (with them removed,
+`TOTK_PROBE_NEGATIVE=2`, all 8 trials read stale bytes).
+
+**The fix** (`third_party/d2r_gfx/gfx/nvn/hle_nvn.c`, new `acq_fence.h`): every `nvnQueuePresentTexture` records the
+newest submission (Metal fence, or the translation thread's submit token) and the image it showed. By default the
+acquire sync waits for the submission of the present that replaced the image on screen, as the hardware does: the
+display releases an image only at the flip to the next one, and that flip needs the next frame's GPU work done. With
+Xenoblade X's 2 swapchain images this equals `old`, the mode the play test showed free of the flicker. `TOTK_ACQ_SYNC`:
+unset = this (`next`); `tex` = the image's own last present, one frame earlier than the hardware (one more frame of
+overlap; experimental, a faster mode to try later); `old` = newest submission at the acquire; `now` = the previous
+immediate signal. Without a record (first frames, `nvnWindowInitialize` again, another window) the sync takes the
+newest submission, never "done at once". The values are submissions already made, so waits end; past 16 presents the
+oldest kept (later) fence stands in. New log lines: the mode once at the first acquire (`[nvn] 取图同步：...`); the
+300-frame `[nvn] 帧间隔` line adds acquires, fenced acquires and CPU waits on acquire syncs with a timeout (count, of
+them timed out, average, longest; polls with timeout 0 are not counted).
+
+**Removed**: the `TOTK_GPU_ORDER` event wait across submissions in `nvn_mtl.m` (added earlier the same day, shown
+unnecessary) with its `flag gpu_order`, read hooks and stats. Kept: the diagnostic count of CPU replay reads of
+unfinished GPU writes (`g_gw_cpu_stale`, a line after the uniform snapshot stats when non-zero), and `probe-gpu-order`
+without the event wait.
+
+**Checked:** `make runtime` (no warning on a changed line); iOS `-fsyntax-only` of `hle_nvn.c` and `nvn_mtl.m`; new
+`probe-gpu-acq-sync` (13 checks with real empty submissions: fence per mode, first frames / window re-init / another
+window take the newest, ring overflow, completion through `nvnSyncWait`, an unreached fence times out and is counted,
+a poll is not); `probe-gpu-order`, `-ubo-snapshot`, `-arg-epoch`, `-ub-rename`, `-copy-alias`, `-dispatch-chain`,
+`-vertex-streams` pass; `tests/test_acq_fence.py` and the other unit tests pass. `probe-gfx` crashes in
+`dm_nvn_probe_copy_marks` (`pin_scan`), code this change does not touch. **Not checked in the game**: the flicker and
+the frame rate at 60 fps need a play test (default; later `TOTK_ACQ_SYNC=tex` as the faster experiment).
