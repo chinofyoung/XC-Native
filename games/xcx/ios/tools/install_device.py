@@ -64,9 +64,15 @@ UNLOCK = ('Unlock the iPhone / iPad and keep it unlocked. If Xcode is preparing 
           'Simulators shows "Preparing"), wait until it has finished, then try again.')
 
 
+MAX_APPS = ('A free Apple ID can have at most 3 sideloaded apps on a device. Remove one you do not need, or use a paid '
+            'developer account. Deleting an app on the iPhone deletes its saves and data, so do not delete an older '
+            'Xenoblade Chronicles X install to make room: this tool installs over it.')
+
+
 def explain(text):
     """What to do for the failures devicectl and xcodebuild are known to report."""
     low = text.lower()
+    if '0xe8008021' in low or '-402620383' in low or 'maximum number of apps' in low: return MAX_APPS
     if 'unlock' in low or 'preparation error' in low or 'passcode' in low or 'locked' in low: return UNLOCK
     if 'developer mode' in low: return 'Turn on Developer Mode on the device: Settings > Privacy & Security > Developer Mode, then restart it.'
     if 'no account' in low or 'no signing certificate' in low or 'no profiles for' in low:
@@ -208,6 +214,30 @@ def old_bundle_ids(bundle_id):
     if bundle_id != BUNDLE_PREFIX and not bundle_id.startswith(BUNDLE_PREFIX + '.'):
         return []
     return list(dict.fromkeys([OLD_BUNDLE_PREFIX + bundle_id[len(BUNDLE_PREFIX):], OLD_BUNDLE_PREFIX]))
+
+
+def app_installed(dev, bundle_id):
+    """True when the device (identifier) holds an app with this identifier. `devicectl device info apps` listed nothing on
+    a real phone, so ask for the app's Documents folder instead: it fails for an app that is not there (and for every app
+    while the phone is locked, which then counts as not installed)."""
+    try:
+        r = subprocess.run(['xcrun','devicectl','device','info','files','--device',dev,'--domain-type','appDataContainer',
+                            '--domain-identifier',bundle_id,'--subdirectory','Documents'], capture_output=True, text=True)
+    except OSError:
+        return False
+    return r.returncode == 0
+
+
+def choose_bundle_id(team, given, installed):
+    """(bundle id, the old identifier it reuses or None). --bundle-id is used as it is. Otherwise org.xcnative.xcx.<team>;
+    when that is not on the device but the app is there under an old identifier, that one, so the install goes over it
+    (saves and game data stay, no extra app slot). `installed(bundle_id)` says whether the device has it."""
+    if given: return given, None
+    new = f'{BUNDLE_PREFIX}.{team.lower()}'
+    if installed(new): return new, None
+    for old in old_bundle_ids(new):
+        if installed(old): return old, old
+    return new, None
 
 
 def container_copy(direction, dev, bundle_id, source, destination):
@@ -382,9 +412,12 @@ def install(a):
     elif len(found) == 1: team = found[0]
     elif found: raise Fail(f'several teams: {", ".join(found)}', 'choose one with --team')
     else: raise Fail('no Apple Development certificate', NO_TEAM)
-    bundle_id = a.bundle_id or f'{BUNDLE_PREFIX}.{team.lower()}'
     dev = pick_device(a.device)
     udid = dev['hardwareProperties']['udid']
+    bundle_id, reused = choose_bundle_id(team, a.bundle_id, lambda b: app_installed(dev['identifier'], b))
+    if reused:
+        say(f'the app is already on this device as {reused}: installing over it (keeps its saves and game data, uses no '
+            f'extra app slot)')
     say(f"team {team}, bundle {bundle_id}, device {dev['deviceProperties'].get('name')} ({udid})")
     emit('plan', team=team, bundle_id=bundle_id, device=describe(dev),
          steps=['device', 'profile', 'sign', 'install'] + (['game data'] if a.game_data else []))

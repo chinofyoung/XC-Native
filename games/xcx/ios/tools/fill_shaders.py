@@ -22,6 +22,7 @@ import argparse, concurrent.futures, hashlib, json, os, re, shutil, subprocess, 
 from pathlib import Path
 from xcode_dir import developer_dir
 from compile_seed import METAL_FLAGS
+from install_device import app_installed, old_bundle_ids
 
 GAME = Path(__file__).resolve().parents[2]   # games/xcx
 VARIANT = re.compile(r'^([0-9a-f]{64})-[0-9a-f]{12}$')
@@ -134,6 +135,11 @@ def main():
     ap.add_argument('--with-done', action='store_true', help='also rebuild the variants filled before (shader-requests/done),'
                     ' e.g. after a change of the compile options; the game replaces their libraries')
     args = ap.parse_args()
+    if args.device and (not args.requests or not args.no_push):   # the device is going to be used
+        if not app_installed(args.device, args.bundle_id):
+            for old in old_bundle_ids(args.bundle_id):
+                if app_installed(args.device, old):
+                    print(f'{args.bundle_id} is not on the device but {old} is: using {old}'); args.bundle_id = old; break
     if not args.requests and not args.device: raise RuntimeError('give --device (or XCX_IOS_DEVICE), or --requests')
     if not args.no_push and not args.device: raise RuntimeError('pushing needs --device (or XCX_IOS_DEVICE); use --no-push')
     tree = args.work.resolve(); ch = chain(); env = xcode_env()

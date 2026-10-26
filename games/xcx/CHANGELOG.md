@@ -1432,3 +1432,24 @@ a poll is not); `probe-gpu-order`, `-ubo-snapshot`, `-arg-epoch`, `-ub-rename`, 
 `-vertex-streams` pass; `tests/test_acq_fence.py` and the other unit tests pass. `probe-gfx` crashes in
 `dm_nvn_probe_copy_marks` (`pin_scan`), code this change does not touch. **Not checked in the game**: the flicker and
 the frame rate at 60 fps need a play test (default; later `TOTK_ACQ_SYNC=tex` as the faster experiment).
+
+### 2026-10-26: iPhone updates install over the old-name app
+
+Since 2026-10-24 the sideloaded app is `org.xcnative.xcx.<team>`, which iOS treats as a new app. On a free Apple ID that
+already has 3 sideloaded apps the install failed (`MIInstallerErrorDomain error 13`, `LibMISErrorNumber = -402620383`
+= 0xE8008021, `ApplicationVerificationFailed`, seen 2026-10-25); with a free slot it made a second app and copied the
+14 GB game data again.
+
+- **`install_device.py`:** without `--bundle-id`, the tool asks the device which identifiers it holds (new `app_installed`:
+  `xcrun devicectl device info files ... --domain-type appDataContainer --domain-identifier <id> --subdirectory Documents`,
+  success means installed; `device info apps` listed 0 apps on the real phone). The new id wins if installed, else
+  `org.macnativegames.xcx.<team>`, else `org.macnativegames.xcx`, else the new id. The old one is installed over, so saves
+  and game data stay and no slot is used. `--dry-run` shows the choice. A locked phone fails every probe, which gives
+  the new id as before. `explain()` now answers the max-apps error (free Apple ID: 3 apps; do not delete the old install,
+  it holds the saves).
+- **`fill_shaders.py`:** when the app id is not on the device but its old-name one is, it uses the old one and says so.
+
+**Checked:** `tests/test_library_migration.py` (`choose_bundle_id` with a fake probe, `explain` on the real error text).
+**Checked on a device** (iPhone 15 Pro Max, iOS 27, 2026-10-26): the probe says installed for the app that is there
+(`org.xcnative.xcx.<team>`) and not installed for both old ids, which are not; `choose_bundle_id` then keeps the new id.
+**Not checked:** an install that actually goes over an old-name app (no phone with one left).

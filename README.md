@@ -308,8 +308,12 @@ Install it with your own Apple ID or a sideloading tool:
   Documents/GameData in 1 GiB parts. Later installs skip the copy while the device holds the same image. A free Apple ID
   signs for 7 days and a paid membership for a year. Run the command again to renew; your saves are kept. On first use,
   trust your Apple ID under Settings › General › VPN & Device Management.
-  Until 2026-10-24 the app was `org.macnativegames.xcx.<team>`. iOS treats the new id as another app, so it appears
-  next to the old one with empty Documents. The first install of the new id copies the old app's saves, shader cache,
+  If the device already has the app under the old name (`org.macnativegames.xcx.<team>` or `org.macnativegames.xcx`),
+  the install goes over it under that name: its saves and game data stay and no extra app slot is used (a probe of the
+  app's Documents finds it; a locked phone hides it, so keep the phone unlocked). A free Apple ID allows 3 sideloaded
+  apps at a time; with 3 already, installing a new app fails with "maximum number of apps".
+  Until 2026-10-24 the app was `org.macnativegames.xcx.<team>`. When this tool does not find that old app (or
+  `--bundle-id` is given), iOS treats the new id as another app, so it appears next to the old one with empty Documents. The first install of the new id copies the old app's saves, shader cache,
   shader list contribution, shader requests and Settings choices over (not the game data, which `--game-data` copies),
   unless the new app already has saves. It reads one save file back from the new app before it counts the copy as
   done; if that fails it says how to copy the `save` folder by hand in Finder or the Files app, and the next install

@@ -185,7 +185,9 @@ where it was when the app was built.
   `app/launcher.m`, `migrate_library` in `scripts/app_bundle.py`). The bundle id is `org.xcnative.xcx` (was
   `org.macnativegames.xcx`); the launcher takes the old settings over. Rebuild or delete apps built before this
   change: an older app would write to the MacNativeGames folder again. On an iPhone / iPad the new id is a new app:
-  `ios/tools/install_device.py` copies the old app's saves and settings over once (see the root README). It counts as
+  `ios/tools/install_device.py` installs over an old-name app when the device has one (saves and game data stay, no extra
+  app slot; a free Apple ID allows 3 sideloaded apps), and otherwise copies its saves and settings over once (see the
+  root README). The new id then counts as
   one more App ID for a free Apple ID (about 10 per 7 days), and the new app needs the 14 GB game data again while the
   old one keeps its copy: check free space, and delete the old app only after the new one shows your saves.
 - Log: `~/Library/Logs/XCNative/xcx.log` (both kinds; its `[launcher]` line says which kind ran and where the

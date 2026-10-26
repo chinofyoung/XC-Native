@@ -191,6 +191,62 @@ class FakeDevice:
 NEW, OLD_TEAM, OLD = 'org.xcnative.xcx.abcde12345', 'org.macnativegames.xcx.abcde12345', 'org.macnativegames.xcx'
 
 
+class ChooseBundleId(unittest.TestCase):
+    TEAM = 'ABCDE12345'
+
+    def choose(self, given, apps):
+        asked = []
+        def installed(b):
+            asked.append(b)
+            return b in apps
+        return install_device.choose_bundle_id(self.TEAM, given, installed), asked
+
+    def test_new_installed_keeps_new(self):
+        self.assertEqual(self.choose(None, {NEW, OLD_TEAM})[0], (NEW, None))
+
+    def test_only_old_team_id(self):
+        self.assertEqual(self.choose(None, {OLD_TEAM, OLD})[0], (OLD_TEAM, OLD_TEAM))
+
+    def test_only_bare_old_id(self):
+        self.assertEqual(self.choose(None, {OLD})[0], (OLD, OLD))
+
+    def test_none_installed(self):
+        self.assertEqual(self.choose(None, set())[0], (NEW, None))
+
+    def test_explicit_id_is_not_probed(self):
+        result, asked = self.choose('com.example.mine', {OLD})
+        self.assertEqual(result, ('com.example.mine', None))
+        self.assertEqual(asked, [])
+
+    def test_app_installed_follows_return_code(self):
+        calls = []
+        def fake(cmd, **kw):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0 if cmd[cmd.index('--domain-identifier') + 1] == NEW else 1, '', 'x')
+        with mock.patch.object(install_device.subprocess, 'run', fake):
+            self.assertTrue(install_device.app_installed('dev-1', NEW))
+            self.assertFalse(install_device.app_installed('dev-1', OLD))
+        self.assertEqual(calls[0][:8], ['xcrun', 'devicectl', 'device', 'info', 'files', '--device', 'dev-1', '--domain-type'])
+        self.assertEqual(calls[0][-2:], ['--subdirectory', 'Documents'])
+
+
+class MaxApps(unittest.TestCase):
+    REAL = ('ERROR: Failed to install the app on the device. (MIInstallerErrorDomain error 13.)\n'
+            'NSLocalizedDescription = ApplicationVerificationFailed, LibMISErrorNumber = -402620383')
+
+    def test_real_error_text(self):
+        hint = install_device.explain(self.REAL)
+        self.assertIn('at most 3 sideloaded apps', hint)
+        self.assertIn('do not delete an older Xenoblade Chronicles X install', hint)
+
+    def test_other_spellings(self):
+        for text in ('error 0xE8008021', 'Maximum Number of Apps reached'):
+            self.assertIn('at most 3', install_device.explain(text))
+
+    def test_unrelated_text_is_not_max_apps(self):
+        self.assertNotIn('at most 3', install_device.explain('Developer Mode is off') or '')
+
+
 class CarryOver(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
