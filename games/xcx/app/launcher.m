@@ -20,6 +20,9 @@
      "frame_rate"; XCX_FRAME_RATE=30|60 from the environment wins for one start, for scripted checks). Either way on a 60 Hz
      present base (DM_PRESENT_HZ=60) with the game's present interval 1. The internal resolution is the game's own
      (dynamic, up to 1600x900).
+   - Rendering: docked (the default) or handheld (TOTK_OPERATION_MODE=docked|handheld: the game uses its own Switch handheld
+     settings, a 1280x720 output and a lower internal resolution, so the GPU renders less; input is the same; not part of the
+     presets, saved as "handheld"; TOTK_OPERATION_MODE from the environment wins for one start, for scripted checks).
    - Monitor (XCX_DISPLAY), window or full screen (XCX_FULLSCREEN), window size (TOTK_WINDOW_SIZE), the full-screen
      output resolution (TOTK_DRAWABLE_SCALE relative to the monitor's pixels) and the scaler (MetalFX spatial upscaling of
      the game's picture to the output, TOTK_MFX_UPSCALE / TOTK_MFX_OUTPUT, or plain linear scaling).
@@ -106,7 +109,7 @@ static NSString *screen_name(NSScreen *s) { return s.localizedName ?: @"?"; }
 @interface Launcher : NSObject <NSApplicationDelegate, NSWindowDelegate>
 @property NSWindow *window;
 @property NSPopUpButton *preset, *size, *monitor, *output, *mod, *fps;
-@property NSSegmentedControl *display, *scaler;
+@property NSSegmentedControl *display, *scaler, *rendering;
 @property NSButton *hud, *play; @property NSTextField *note;
 @property NSArray<NSString *> *mods; @property BOOL applying, launch;
 @end
@@ -137,6 +140,7 @@ static NSString *screen_name(NSScreen *s) { return s.localizedName ?: @"?"; }
     self.scaler = [self segments:@[T("MetalFX (más nítido)", "MetalFX (sharper)"), T("Normal", "Plain")]];
     self.mod = [self popup:@[T("Ninguno", "None")]]; self.mods = romfs_mods(); [self.mod addItemsWithTitles:self.mods];
     self.fps = [self popup:@[T("30 (original)", "30 (original)"), T("60 (experimental)", "60 (experimental)")]];
+    self.rendering = [self segments:@[T("Sobremesa (más nítido)", "Docked (sharper)"), T("Portátil (más rápido)", "Handheld (faster)")]];
     self.hud = [NSButton checkboxWithTitle:T("Mostrar FPS y resolución (tecla 1 lo oculta)", "Show FPS and resolution (key 1 hides it)") target:self action:@selector(changed:)];
     self.note = [NSTextField wrappingLabelWithString:@""]; self.note.textColor = NSColor.secondaryLabelColor; self.note.font = [NSFont systemFontOfSize:11];
     self.play = [NSButton buttonWithTitle:T("Jugar", "Play") target:self action:@selector(start:)]; self.play.keyEquivalent = @"\r";
@@ -145,6 +149,7 @@ static NSString *screen_name(NSScreen *s) { return s.localizedName ?: @"?"; }
     NSGridView *grid = [NSGridView gridViewWithViews:@[
         @[[self label:T("Preset", "Preset")], self.preset],
         @[[self label:T("Imágenes por segundo", "Frame rate")], self.fps],
+        @[[self label:T("Renderizado", "Rendering")], self.rendering],
         @[[self label:T("Monitor", "Monitor")], self.monitor],
         @[[self label:T("Pantalla", "Display")], self.display],
         @[[self label:T("Tamaño de la ventana", "Window size")], self.size],
@@ -193,6 +198,7 @@ static NSString *screen_name(NSScreen *s) { return s.localizedName ?: @"?"; }
     [self.monitor selectItemAtIndex:(NSInteger)mi];
     self.hud.state = [d objectForKey:@"hud"] ? [d boolForKey:@"hud"] : YES;
     [self.fps selectItemAtIndex:[d integerForKey:@"frame_rate"] == 60 ? 1 : 0];
+    self.rendering.selectedSegment = [d boolForKey:@"handheld"];
     NSString *mod = [d stringForKey:@"mod"]; NSUInteger i = mod ? [self.mods indexOfObject:mod] : NSNotFound;
     [self.mod selectItemAtIndex:i == NSNotFound ? 0 : (NSInteger)i + 1];
 }
@@ -212,7 +218,7 @@ static NSString *screen_name(NSScreen *s) { return s.localizedName ?: @"?"; }
 - (void)presetChanged:(id)sender { (void)sender; NSInteger i = self.preset.indexOfSelectedItem; if (i < NPRESETS) [self applyPreset:(int)i]; [self refresh]; [self save]; }
 - (void)monitorChanged:(id)sender { (void)sender; [self fillOutputs:(int)self.output.selectedItem.tag]; [self refresh]; [self save]; }
 - (void)changed:(id)sender {
-    if (!self.applying && sender != self.hud && sender != self.mod && sender != self.fps) [self.preset selectItemAtIndex:NPRESETS];
+    if (!self.applying && sender != self.hud && sender != self.mod && sender != self.fps && sender != self.rendering) [self.preset selectItemAtIndex:NPRESETS];
     [self refresh]; [self save];
 }
 - (void)refresh {
@@ -240,6 +246,7 @@ static NSString *screen_name(NSScreen *s) { return s.localizedName ?: @"?"; }
     [d setObject:screen_name(self.chosenScreen) forKey:@"monitor"];
     [d setBool:self.hud.state forKey:@"hud"];
     [d setInteger:self.fps.indexOfSelectedItem == 1 ? 60 : 30 forKey:@"frame_rate"];
+    [d setBool:self.rendering.selectedSegment == 1 forKey:@"handheld"];
     if (self.mod.indexOfSelectedItem > 0) [d setObject:self.mods[self.mod.indexOfSelectedItem - 1] forKey:@"mod"]; else [d removeObjectForKey:@"mod"];
     CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);   // the launcher then replaces itself with the game (exec)
 }
@@ -395,6 +402,8 @@ int main(int argc, char **argv) {
             if (![[list componentsSeparatedByString:@","] containsObject:@"60fps"]) list = list.length ? [list stringByAppendingString:@",60fps"] : @"60fps";
             setenv("XCX_PATCHES", list.UTF8String, 1);
         }
+        const char *om = getenv("TOTK_OPERATION_MODE");   // handheld: the game's own handheld settings (see the comment at the top)
+        if (!(om && *om)) setenv("TOTK_OPERATION_MODE", [d boolForKey:@"handheld"] ? "handheld" : "docked", 1);
         setenv("DM_PRESENT_HZ", "60", 1);   // the present base at both frame rates: the game presents with interval 1, its own cap paces it
 
         NSArray<NSScreen *> *all = NSScreen.screens; NSUInteger mi = [all indexOfObject:NSScreen.mainScreen];
@@ -452,6 +461,7 @@ int main(int argc, char **argv) {
                   bundled ? cache.UTF8String : "next to the game binary (build/shader-cache)"); }
         fprintf(stderr, "[launcher] game version %s (%s)\n", TOTK_GAME_VERSION, TOTK_GAME_DIR);
         fprintf(stderr, "[launcher] frame rate %d (%s)\n", fps60 ? 60 : 30, fr && *fr ? "XCX_FRAME_RATE" : "setting");
+        fprintf(stderr, "[launcher] operation mode %s (%s)\n", getenv("TOTK_OPERATION_MODE"), om && *om ? "TOTK_OPERATION_MODE" : "setting");
         fprintf(stderr, "[launcher] shader list contribution %s (%lu rows, reminder: %s)\n", contrib.UTF8String,
                 (unsigned long)totk_contrib_read(contrib).count, reminder);
         fprintf(stderr, "[launcher] work %s, patches %s, present %s Hz, display %s, fullscreen %s, window %s, drawable scale %s, MetalFX %s, mod %s\n",

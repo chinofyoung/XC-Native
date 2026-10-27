@@ -167,9 +167,9 @@ make install WORK=$WORK                                         # optional: a co
 ```
 
 Launch it like any Mac app: double-click `XCX_build/Xenoblade Chronicles X.app` in Finder (or `open` it). A
-settings window comes first (presets, frame rate, monitor, window or full screen, window size, output resolution,
-scaler, interface mod, FPS overlay; no internal-resolution setting, as no patch for it exists); Play starts the game with
-the switches the terminal runs set by hand
+settings window comes first (presets, frame rate, rendering (docked, or handheld: the game's own lower handheld
+resolution), monitor, window or full screen, window size, output resolution, scaler, interface mod, FPS overlay); Play
+starts the game with the switches the terminal runs set by hand
 (`TOTK_GPU_ALLOW_SUBMIT=1` and the rest), the game's own 30 fps unless the frame rate is set to 60 (experimental, see
 [60 fps](#60-fps-experimental)), the compact HUD, MetalFX upscaling and frame
 interpolation off (key 2 still toggles interpolation; on an M1 it costs real frames). The development app does not hold

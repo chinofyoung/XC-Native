@@ -203,8 +203,10 @@ game.
 - The default preset is "Original (30 fps, window)"; "Original (30 fps, full screen)" is the other one. Both run the
   game's own 30 fps and dynamic resolution without MetalFX upscaling.
 - The window also chooses the monitor, window or full screen, the window size, the full-screen output resolution, the
-  scaler (MetalFX or plain), an interface mod and the FPS overlay. There is no frame-rate or internal-resolution
-  setting: the code patches they would need do not exist for this game.
+  scaler (MetalFX or plain), an interface mod and the FPS overlay. The internal resolution is the game's own; the
+  Rendering setting below is the only way to lower it.
+- **Rendering** is docked (the default, sharper) or handheld (faster): handheld makes the game use its own Switch handheld
+  settings, a 1280x720 output and a lower internal resolution, so the GPU renders less.
 - The first start checks the whole RomFS once (the first frame takes about 10 s); later starts reuse that record.
 - Shaders are translated the first time the game meets them and kept in the shader cache, so the first minutes of a new
   install stutter more than later ones.
