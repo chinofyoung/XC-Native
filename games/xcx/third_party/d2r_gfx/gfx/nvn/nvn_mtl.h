@@ -58,6 +58,7 @@ int mtl_probe_ubo_snapshot(void);
 int mtl_probe_drv_c0(void);
 int mtl_probe_dispatch_chain(void);
 int mtl_probe_gpu_order(void);
+int mtl_probe_skin_order(void);
 int nvn_probe_acq_sync(void);   // hle_nvn.c: acquire-sync fences (TOTK_ACQ_SYNC)
 int mtl_probe_copy_alias(void);
 int mtl_probe_layer_merge(void);

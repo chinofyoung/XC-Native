@@ -1453,3 +1453,67 @@ already has 3 sideloaded apps the install failed (`MIInstallerErrorDomain error 
 **Checked on a device** (iPhone 15 Pro Max, iOS 27, 2026-10-26): the probe says installed for the app that is there
 (`org.xcnative.xcx.<team>`) and not installed for both old ids, which are not; `choose_bundle_id` then keeps the new id.
 **Not checked:** an install that actually goes over an old-name app (no phone with one left).
+
+### 2026-10-27: skinning draws wait for earlier draws' reads (stretched meshes in field battles)
+
+**Found** (owner's play tests, 60 fps more than 30): in field battles single frames show a skinned mesh stretched with
+another object's bone matrices (beige spikes from a party member toward an enemy). Per frame the game runs about 66
+rasterizer-discard skinning draws (vertex shaders `e2573156`, `326267ec`, `8ece1e30`; 132 `SetRasterizerDiscard`
+toggles) that write bone data into one 192,000-byte storage buffer (bound as a plain sized `sbuf`, rw), each followed
+by the skinned draws that read it. They interleave in one render encoder: skin A, draws of A, skin B, draws of B. The
+game's own `nvnCommandBufferBarrier` is recorded (`hle_nvn.c`) but the replay drops `OP_BARRIER`, and the only
+in-encoder ordering was the Vertex to Vertex|Fragment barrier after each skinning draw (A's writes before later reads).
+Nothing ordered the earlier draws' reads before the next skinning draw's writes: a write-after-read hazard.
+
+| Run (60 fps, field battle) | Result |
+| --- | --- |
+| default | glitch |
+| `XCX_SKIN_SPLIT=1` (end the pass after each skinning draw) | glitch remains |
+| `XCX_SKIN_SPLIT=2` (also end it before each) | glitch gone, 40-50 fps |
+| `DM_EXP_SUBMIT_WAIT=1` (CPU waits after each submit) | glitch remains: not CPU/GPU overlap |
+
+**Who reads the bones:** the bone block is read by vertex shaders only. The skinned vertex shaders index it
+dynamically as `vp_c5` (a vertex-stage uniform block; the key table at `rt_is_skin` was read from the same source), the
+three writers have only vertex-stage bindings (`vp_s0`, `rw`), and the reflection of `e2573156` lists `vp_c3`, `vp_c4`,
+`vp_s0`. The SDK headers (`MTL4CommandEncoder.h`, `MTLRenderCommandEncoder.h`) do not say whether a Fragment to Vertex
+barrier is allowed inside a render pass, so the fix does not rely on one; it counts instead, at run time, the draws
+whose vertex or fragment stage has a buffer binding overlapping the latest skinning write range (see the log line below).
+
+**The fix** (`third_party/d2r_gfx/gfx/nvn/nvn_mtl.m`, `skin_before_write` / `skin_note_read`, called from
+`draw_inner`): before a skinning draw, if another draw was encoded in the same render pass since the last such barrier,
+the encoder gets one `barrierAfterEncoderStages:Vertex beforeEncoderStages:Vertex` (Metal 4 intra-pass barrier through
+`enc_r_barrier`, also on the encoding-thread path). Coalescing: a batch of consecutive skinning draws gets one before
+the first; none when no other draw came since the last one, and none after a pass break (`g_pass.serial`). The barrier
+costs no pass break, unlike `XCX_SKIN_SPLIT=2`. Translating `OP_BARRIER` instead was not chosen: the game's barrier
+does not say which stages or resources it orders, so every one would need the widest barrier, and the layer already
+inserts barriers where it knows the hazard (after the skinning draw); this one is the missing half of the same pair.
+`XCX_SKIN_BARRIER=0` turns it off for A/B (log: `【实验】XCX_SKIN_BARRIER=0：...` once; with the default one line says it
+is on). Every 20000 barriers (and the first) the log adds `XCX_SKIN_BARRIER：已加读后写栅栏 N 次（帧 F），绑骨骼缓冲的绘制：
+顶点阶段 V 次，片元阶段 G 次`; the fragment count should stay 0 (a first non-zero one logs its own line). `XCX_SKIN_SPLIT`
+stays an experiment and composes with it: a pass break starts a new pass serial, so no barrier is added after one.
+
+**Removed:** the diagnostic `TOTK_ACQ_BLOCK` in `nvnWindowAcquireTexture` (`hle_nvn.c`), disproved by the A/B above.
+
+**Checked:** `make runtime` for v200 and v101 (no warning on a changed line); iOS `-fsyntax-only` of `nvn_mtl.m`,
+`hle_nvn.c` and `gpu_path_probe.m` (no error); new `probe-gpu-skin-order` (5 checks, v200 and v101): through the production
+replay, an ordinary draw whose vertex shader spins and then reads a buffer through a uniform binding, followed by a
+rasterizer-discard draw writing it, in one encoder; 16 trials, all pixels hold the old value, the skinning write landed, 16
+barriers; `B B A B B B` adds exactly one barrier; with `TOTK_PROBE_NEGATIVE=20` (or `XCX_SKIN_BARRIER=0`) it expects none.
+`probe-gpu-order`, `-vertex-streams`, `-ubo-snapshot`, `-arg-epoch`, `-ub-rename`, `-copy-alias`, `-dispatch-chain`,
+`-acq-sync`, `-layer-merge`, `-drv-c0`, `-tex-slots` pass on both versions; the unit tests in `tests/` pass except
+`test_process_shader_issue.py` (the `--author-created` date check fails, unrelated; no file of it was touched). **Not
+checked:** with the barrier off the probe does not see the race on an Apple M1 (several draw sizes and spin lengths
+tried), so it does not prove that the barrier is what stops a stale read; the game does (A/B above). `probe-gpu-tile`
+needs `TOTK_PROBE_TILE_VS/_CB/_SB` and was not run.
+
+**Checked in the game** (owner's Mac, development app `XCX_build/Xenoblade Chronicles X.app`, runtime `xcx-native-v200`,
+2.0.0, 60 fps patch on, handheld rendering, East Gate Plain field battle with a Grassland Ovis, 2026-10-27; the Mac
+model was not recorded): with the default (barrier on) the owner saw no stretched meshes. With `XCX_SKIN_BARRIER=0` the
+glitch came back (owner's report). `~/Library/Logs/XCNative/xcx.log` has the on-line
+(`XCX_SKIN_BARRIER：蒙皮绘制前加 Vertex -> Vertex 读后写栅栏（默认，=0 关）`) and, by frame 4830, about 260,001
+barriers; draws binding the skinning-written buffer: vertex stage 7,005,842, fragment stage 0, so only the vertex stage
+reads the bones in this scene. Frame rate with the fix, 1800-frame means: 57.7 fps (17.32 ms, 9 frames held at 50 ms),
+58.8 fps (17.01 ms), 59.3 fps (16.85 ms). The `[nvn] 计时` line at frame 4800: frame p50 16.62 ms / p95 17.21 ms, GPU
+p50 8.73 ms / p95 10.60 ms, NVN submit plus present p50 1.41 ms. Before the fix (the 16:10 session) the same field ran
+57.6-58.8 fps, so no cost shows. **Not checked in the game:** an iPhone, update 1.0.1, other scenes with skinned meshes
+(only this field battle was watched), and a side by side frame rate with `XCX_SKIN_BARRIER=0` in the same session.

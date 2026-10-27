@@ -9744,9 +9744,62 @@ static int prog_vs_stores(NvProg *pr) {
     for (int i = 0; i < vs->rf.nb; i++) if (vs->rf.b[i].kind == NVN_RB_SBUFP && vs->rf.b[i].rw) return 1;
     return 0;
 }
+/* XCX experiment XCX_SKIN_SPLIT (2026-10-27, off by default; heavy, A/B only): close the intra-encoder vertex -> vertex hazard of
+   the skinning pass the heavy way. 1 = end the render pass after each skinning draw (its bone writes are ordered before every
+   later draw by the encoders' full queue barriers instead of the in-encoder vertex barrier); 2 = also end it before each one
+   (earlier draws' reads of the bone buffer finish before the next skinning draw overwrites it: write-after-read). The game's
+   own nvnCommandBufferBarrier is not translated (OP_BARRIER is ignored), so neither ordering exists otherwise. Costs a pass
+   break (load / store of the attachments) per skinning draw. */
+static int skin_split(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("XCX_SKIN_SPLIT"); v = e ? atoi(e) : 0; if (v) MLOG("【实验】XCX_SKIN_SPLIT=%d：蒙皮绘制%s结束渲染通道（重，只供 A/B）", v, v >= 2 ? "前后都" : "后"); }
+    return v;
+}
+static uint64_t g_skin_splits;
+/* XCX 蒙皮读后写栅栏（2026-10-27，默认开，XCX_SKIN_BARRIER=0 关，只供 A/B）：一帧里蒙皮绘制（骨骼写进同一块 192000 字节的存储缓冲）和读骨骼的绘制在同一个编码器里交替：
+   蒙皮 A、A 的绘制、蒙皮 B、B 的绘制……。绘制 A 的顶点阶段还在读骨骼槽时，蒙皮 B 的顶点阶段可能已经在覆盖它们（写后读之外的写前读 = 读后写），
+   游戏自己的 nvnCommandBufferBarrier 回放时丢掉（OP_BARRIER），蒙皮后的 Vertex -> Vertex|Fragment 栅栏只管 A 的写先于后面的读。
+   所以蒙皮绘制前，若这个通道里自上次栅栏以来画过别的绘制，就编码一道 Vertex -> Vertex 栅栏（比断开通道轻得多）。读骨骼的是顶点着色器（见 skin_note_read 的计数）。
+   | XCX skinning write-after-read barrier (2026-10-27, default on, XCX_SKIN_BARRIER=0 turns it off, A/B only): within a frame the skinning draws (bone writes into one 192000-byte storage buffer)
+   and the draws that read the bones alternate in one encoder: skin A, draws of A, skin B, draws of B, ... While draw A's vertex stage still reads bone slots, skin B's vertex stage may already overwrite
+   them (a read-then-write hazard); the game's own nvnCommandBufferBarrier is dropped at replay (OP_BARRIER), and the Vertex -> Vertex|Fragment barrier after a skinning draw only orders A's writes before later reads.
+   So before a skinning draw, if another draw was encoded in this pass since the last barrier, one Vertex -> Vertex barrier is encoded (far lighter than ending the pass). The bone readers are vertex shaders (counted in skin_note_read). */
+static int g_skb_probe_off;   // probe-gpu-skin-order negative control only
+static int skin_barrier(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("XCX_SKIN_BARRIER"); v = e ? atoi(e) > 0 : 1;
+        if (!v) MLOG("【实验】XCX_SKIN_BARRIER=0：蒙皮绘制前不加读后写栅栏（回到 2026-10-26 的行为，只供 A/B）"); else MLOG("XCX_SKIN_BARRIER：蒙皮绘制前加 Vertex -> Vertex 读后写栅栏（默认，=0 关）"); }
+    return v && !g_skb_probe_off;
+}
+static uint64_t g_skb_pass;                 // 通道序号：这个通道里自上次栅栏以来画过非蒙皮绘制（0 = 没有） | pass serial in which a non-skinning draw was encoded since the last barrier (0 = none)
+static uint64_t g_skb_lo, g_skb_hi;         // 最近一次蒙皮绘制写的存储缓冲范围（诊断用） | storage range written by the latest skinning draw (diagnostic)
+static uint64_t g_skb_n, g_skb_vtx, g_skb_frag;
+static int skb_overlaps(int st) {
+    for (int r = 0; r < 16; r++) { const p_bind_buf *u = &S.ubo[st][r], *s = &S.ssbo[st][r];
+        if (u->addr && u->addr < g_skb_hi && g_skb_lo < u->addr + (u->size ? u->size : 1)) return 1;
+        if (s->addr && s->addr < g_skb_hi && g_skb_lo < s->addr + (s->size ? s->size : 1)) return 1; }
+    return 0;
+}
+static void skin_note_read(void) {   // a non-skinning draw is about to be encoded: it may read the bones
+    g_skb_pass = g_pass.serial;
+    if (!g_skb_hi) return;
+    if (skb_overlaps(0)) g_skb_vtx++;
+    if (skb_overlaps(4)) { if (!g_skb_frag++) MLOG("XCX_SKIN_BARRIER：有绘制的片元阶段绑了蒙皮写过的缓冲（Vertex -> Vertex 栅栏管不到它的读，需要片元 -> 顶点栅栏）"); }
+}
+static void skin_before_write(__unsafe_unretained NvProg *pr) {   // a skinning draw is about to be encoded
+    __unsafe_unretained NvShader *vs = pr->sh[0];
+    for (int i = 0; i < vs->rf.nb; i++) { const nvn_rbind *b = &vs->rf.b[i];
+        if (b->kind == NVN_RB_SBUFP && b->rw && b->reg < 16 && S.ssbo[0][b->reg].addr) { const p_bind_buf *u = &S.ssbo[0][b->reg]; g_skb_lo = u->addr; g_skb_hi = u->addr + (u->size ? u->size : 1); } }
+    if (!skin_barrier() || !g_enc || !g_skb_pass || g_skb_pass != g_pass.serial) return;
+    enc_r_barrier(g_enc, MTLStageVertex, MTLStageVertex); g_skb_pass = 0;
+    if (++g_skb_n % 20000 == 1) MLOG("XCX_SKIN_BARRIER：已加读后写栅栏 %llu 次（帧 %llu），绑骨骼缓冲的绘制：顶点阶段 %llu 次，片元阶段 %llu 次", (unsigned long long)g_skb_n, (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)g_skb_vtx, (unsigned long long)g_skb_frag);
+}
+static inline int skin_split_safe(void) { return g_enc && !g_fz.active && !g_lay.active && !g_cg.replaying && !g_defer_replaying; }
 static void draw(const p_draw *dw, const p_draw_idx *di) {
     g_draw_depth++; draw_inner(dw, di); if (g_draw_depth == 1) nan_draw_probe(dw, di); g_draw_depth--;
-    if (g_rd_store_drawn) { g_rd_store_drawn = 0; if (g_enc) enc_r_barrier(g_enc, MTLStageVertex, MTLStageVertex | MTLStageFragment); }
+    if (g_rd_store_drawn) { g_rd_store_drawn = 0;
+        if (skin_split() && skin_split_safe()) { rp_end(); if (++g_skin_splits % 20000 == 1) MLOG("XCX_SKIN_SPLIT：已断开通道 %llu 次（帧 %llu）", (unsigned long long)g_skin_splits, (unsigned long long)atomic_load(&g_cur_frame)); }
+        else if (g_enc) enc_r_barrier(g_enc, MTLStageVertex, MTLStageVertex | MTLStageFragment); }
 }
 // TOTK: an update makes the argument buffers of the stages whose bound uniform ranges overlap it stale.
 static void upd_dirty_stages(uint64_t lo, uint64_t hi) {
@@ -10123,6 +10176,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (di && di->itype == 0 && di->count && pend_hits(di->ibuf, (uint64_t)di->count)) widen_indices_gpu(di);
     /* Merge/skip checks can resolve sampling views too; prepare before any of those checks. */
     int rd_store = S.raster_discard && !S.render_disabled && prog_vs_stores(pr);   // XCX: see draw()
+    if (rd_store && skin_split() >= 2 && skin_split_safe()) { rp_end(); g_skin_splits++; }   // XCX_SKIN_SPLIT=2: earlier reads of the bone buffer end before this write
     if (rd_store) prepare_draw_textures(pr);
     else if (!S.render_disabled && !S.raster_discard) { prepare_draw_textures(pr); if (mfxup_draw(pr)) return; }   // docked: MetalFX wrote the canvas instead of this draw
     if (g_ruler_truth == 0) {   // 尺子负对照（DM_NVN_RULER_NEG=<片元键>）：被测模式下丢掉该着色器的绘制，尺子必须报不等价 | Ruler negative control (DM_NVN_RULER_NEG=<fragment key>): in the mode under test drop this shader's draws, and the ruler must report non-equivalence
@@ -10318,6 +10372,7 @@ frz_plain:;
     __unsafe_unretained id<MTLRenderPipelineState> ps = cur_ps;
     if (!ps) { g_draw_skip[9]++; static int failed_n; if (failed_n++ < 3) MLOG("[pipeline-draw] rt-depth=%p serial=%llu fmt=%#x pass-depth=%u dt=%u dw=%u fs-depth=%d", R.rt.depth, (unsigned long long)(R.rt.depth ? R.rt.depth->serial : 0), R.rt.depth ? R.rt.depth->d.format : 0, g_pass.dfmt, S.ds.dt, S.ds.dw, pr->sh[1] ? pr->sh[1]->writes_depth : 0); return; }
     if (ps != g_enc_pso) { enc_r_pso(en, ps); g_enc_pso = ps; }
+    if (rd_store) skin_before_write(pr); else skin_note_read();   // XCX: see skin_barrier
     if (rd_store) { g_rd_store_drawn = 1; static int once; if (!once++) MLOG("rasterizer discard: drawing vertex shader %.16s (it writes storage buffers), frame %llu", pr->sh[0]->key, (unsigned long long)atomic_load(&g_cur_frame)); }
     static id<MTLDepthStencilState> cur_ds; static uint64_t cur_ds_pass;
     if (g_dss_dirty || cur_ds_pass != g_pass.serial) { cur_ds = dss_get(g_pass.hd, g_pass.hs); cur_ds_pass = g_pass.serial; g_dss_dirty = 0; }
@@ -14363,6 +14418,88 @@ int mtl_probe_layer_merge(void) {
     for (int i = 0; i < 4; i++) defer_obj_release(rb[i]);
     for (id o in @[cube, arr, arr2]) defer_obj_release(o);
     return checked + 5 * 4;
+}
+
+/* XCX probe (2026-10-27): skinning write-after-read through the production replay (mtl_exec -> draw -> draw_inner). Draw A is an
+   ordinary draw (300000 vertices) whose vertex shader spins, then reads X[0] through a uniform binding like the game's vp_c5 (the load
+   address depends on the spin result, so it cannot be hoisted) and outputs it as the pixel colour; draw B is a rasterizer-discard draw whose vertex shader writes X[0] (a skinning draw: rw storage
+   buffer), in the same encoder right after A. Without the read-then-write barrier B's vertex stage can overwrite X[0] while A still
+   spins, and A's pixels show the new value. Every pixel must hold the old value (100) and X[0] must end as 200. A second scenario
+   (B, B, A, B, B, B in one pass) must add exactly one barrier: none before the first B (no draw yet), one before the first B after A,
+   none between consecutive skinning draws. Negative control: TOTK_PROBE_NEGATIVE=20 drops the barrier (as XCX_SKIN_BARRIER=0 does); the probe then
+   expects zero barriers and fails if it sees the race. On an Apple M1 the race never showed in this stand-alone setup (several draw
+   sizes and spin lengths tried), so without the barrier it passes and says so: the probe proves the production emission points,
+   the coalescing and that the draws still read the old value with the barrier, not that the barrier is what prevents a stale read. */
+int mtl_probe_skin_order(void) {
+    mtl_init(); int checked = 0;
+    const char *ne = getenv("TOTK_PROBE_NEGATIVE"); g_skb_probe_off = ne && atoi(ne) == 20;
+    // Sources in the translated shaders' shape (entry main0 returning main0_out): the discard draw's void variant is made from the text.
+    NSString *head = @"#include <metal_stdlib>\nusing namespace metal;\nstruct _23 { uint _m0[1]; };\nstruct _16 { float4 _m0[4096]; };\n"
+        "struct spvDescriptorSetBuffer0 { device _23* vp_s0 [[id(0)]]; };\nstruct spvDescriptorSetBuffer1 { constant _16* vp_c5 [[id(0)]]; };\n"
+        "struct main0_out { float4 gl_Position [[position]]; uint m_0 [[user(locn0), flat]]; };\n";
+    NSString *vsrc[2] = {
+        [head stringByAppendingString:@"vertex main0_out main0(constant spvDescriptorSetBuffer1& spvDescriptorSet0 [[buffer(0)]], uint gl_VertexIndex [[vertex_id]])\n{\n    main0_out out = {};\n"
+         "    uint i3 = gl_VertexIndex % 3u; float2 p = float2(float((i3 << 1u) & 2u), float(i3 & 2u));\n    out.gl_Position = float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+         "    uint a = as_type<uint>((*spvDescriptorSet0.vp_c5)._m0[0].y);\n    for (uint k = 0u; k < 2048u; k++) a = a * 1664525u + 1013904223u;\n"
+         "    out.m_0 = as_type<uint>((*spvDescriptorSet0.vp_c5)._m0[0][a == 0xdeadbeefu ? 1u : 0u]);\n    return out;\n}\n"],
+        [head stringByAppendingString:@"vertex main0_out main0(constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]], uint gl_VertexIndex [[vertex_id]])\n{\n    main0_out out = {};\n"
+         "    out.gl_Position = float4(0.0, 0.0, 0.0, 1.0);\n    out.m_0 = 0u;\n    if (gl_VertexIndex == 0u) (*spvDescriptorSet0.vp_s0)._m0[0] = 200u;\n    return out;\n}\n"]};
+    NSString *fsrc = [head stringByAppendingString:@"struct main0_in { uint m_0 [[user(locn0), flat]]; };\nstruct main0_fout { float4 c [[color(0)]]; };\n"
+        "fragment main0_fout main0(main0_in in [[stage_in]])\n{\n    main0_fout out = {};\n    out.c = float4(float(in.m_0) / 255.0, 0.0, 0.0, 1.0);\n    return out;\n}\n"];
+    NSError *e = nil; id<MTLLibrary> flib = totk_msl_library(fsrc, &e);
+    if (!flib) MDIE("skin-order probe: fragment shader does not compile: %s", e.localizedDescription.UTF8String);
+    NvShader *fs = [NvShader new]; fs->fn = [flib newFunctionWithName:@"main0"]; fs->src = fsrc; fs->stage = 1; strcpy(fs->key, "probe-skin-fs");
+    NvProg *pr[2]; prog_t pg[2]; memset(pg, 0, sizeof pg);
+    for (int k = 0; k < 2; k++) {
+        id<MTLLibrary> lib = totk_msl_library(vsrc[k], &e);
+        if (!lib) MDIE("skin-order probe: vertex shader %d does not compile: %s", k, e.localizedDescription.UTF8String);
+        NvShader *vs = [NvShader new]; vs->fn = [lib newFunctionWithName:@"main0"]; vs->src = vsrc[k]; snprintf(vs->key, sizeof vs->key, "probe-skin-vs%c", k ? 'B' : 'A');
+        vs->rf.nb = 1; vs->rf.b[0] = k ? (nvn_rbind){.kind = NVN_RB_SBUFP, .aid = 0, .reg = 0, .rw = 1} : (nvn_rbind){.kind = NVN_RB_CBUF, .aid = 0, .reg = 2};
+        vs->ae = [vs->fn newArgumentEncoderWithBufferIndex:0]; vs->arg_len = vs->ae.encodedLength;
+        pr[k] = [NvProg new]; pr[k]->sh[0] = vs; pr[k]->sh[1] = fs; pg[k].serial = 0xfffffd30 + (uint64_t)k; serial_put(pg[k].serial, pr[k]);
+    }
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:8 height:8 mipmapped:NO];
+    td.storageMode = MTLStorageModePrivate; td.usage = MTLTextureUsageRenderTarget;
+    id<MTLTexture> tex = [g_dev newTextureWithDescriptor:td]; res_add(tex);
+    tex_t rt; memset(&rt, 0, sizeof rt); rt.serial = 0xfffffd32; rt.d.format = 0x25; rt.d.width = rt.d.height = 8; rt.d.depth = rt.d.levels = 1; rt.d.target = 1; serial_put(rt.serial, tex);
+    const size_t SZ = 16384; uint32_t *x = NULL; if (posix_memalign((void **)&x, SZ, SZ) || !x) MDIE("skin-order probe memory");
+    memset(x, 0, SZ); mtl_pool_add(x, SZ); id<MTLBuffer> rb = probe_buf(8 * 8 * 4);
+    p_bind_buf bx = {0, 0, (uint64_t)(uintptr_t)x, SZ}, bu = {0, 2, (uint64_t)(uintptr_t)x, SZ}; p_flag on = {1}, off = {0}; p_set_rt r; memset(&r, 0, sizeof r); r.n = 1; r.color[0] = &rt;
+    static uint8_t ops[4096]; op_hdr end = {OP_END, 8}; p_draw da = {4, 0, 3 * 100000, 0, 0};   // many vertices: the reader's vertex work spreads over the GPU for a while
+    enum { T = 16 };
+    int stale_trials = 0; uint64_t n0 = g_skb_n;
+    for (int t = 0; t < T; t++) {
+        x[0] = 100; x[1] = 0x1234; uint8_t *w = lp_rec(ops, OP_SET_RT, &r, sizeof r); w = lp_sc(w, 0, 0, 8, 8); w = lp_clear(w, 0, 0, 0, 1);
+        w = lp_rec(w, OP_BIND_SSBO, &bx, sizeof bx); w = lp_rec(w, OP_BIND_UBO, &bu, sizeof bu); w = lp_prog(w, &pg[0]); w = lp_rec(w, OP_DRAW, &da, sizeof da);
+        w = lp_rec(w, OP_RASTER_DISCARD, &on, sizeof on); w = lp_prog(w, &pg[1]); w = lp_draw(w, 0); w = lp_rec(w, OP_RASTER_DISCARD, &off, sizeof off); lp_end(w);
+        mtl_sub_begin(); mtl_exec((const uint8_t *)&end); mtl_exec(ops); rp_end();
+        enc_b_copy_texture_buffer(blit(), tex, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(8, 8, 1), rb, 0, 32, 256);
+        mtl_sub_commit(); mtl_finish();
+        int bad = 0; for (int i = 0; i < 64; i++) if (abs((int)((const uint8_t *)rb.contents)[i * 4] - 100) > 1) bad++;
+        if (x[0] != 200) MDIE("skin-order probe trial %d: the skinning draw did not write (X[0] = %u)", t, x[0]);
+        if (bad) { stale_trials++; MLOG("skin-order probe trial %d: %d of 64 pixels read the skinning draw's value (first pixel %u)", t, bad, ((const uint8_t *)rb.contents)[0]); }
+    }
+    checked += 2;
+    uint64_t dn = g_skb_n - n0; int expect = skin_barrier() ? T : 0;
+    MLOG("skin-order probe: %d trials, %d with a bone read after the skinning write, %llu barriers (expected %d), barrier %s", T, stale_trials, (unsigned long long)dn, expect, skin_barrier() ? "on" : "off");
+    if (dn != (uint64_t)expect) MDIE("skin-order probe: %llu barriers for %d trials, expected %d", (unsigned long long)dn, T, expect);
+    checked++;
+    if (stale_trials) MDIE("skin-order probe%s: draw A read the skinning draw's write in %d of %d trials", skin_barrier() ? "" : " (no barrier: expected)", stale_trials, T);
+    checked++;
+    if (!skin_barrier()) MLOG("skin-order probe: no barrier and still no stale read (the race did not show)");
+    // coalescing: B B A B B B in one pass
+    { x[0] = 100; x[1] = 0x1234; uint8_t *w = lp_rec(ops, OP_SET_RT, &r, sizeof r); w = lp_sc(w, 0, 0, 8, 8); w = lp_rec(w, OP_BIND_SSBO, &bx, sizeof bx);
+      w = lp_rec(w, OP_RASTER_DISCARD, &on, sizeof on); w = lp_prog(w, &pg[1]); w = lp_draw(w, 0); w = lp_draw(w, 0);
+      w = lp_rec(w, OP_RASTER_DISCARD, &off, sizeof off); w = lp_prog(w, &pg[0]); w = lp_draw(w, 0);
+      w = lp_rec(w, OP_RASTER_DISCARD, &on, sizeof on); w = lp_prog(w, &pg[1]); w = lp_draw(w, 0); w = lp_draw(w, 0); w = lp_draw(w, 0); lp_end(w);
+      mtl_sub_begin(); mtl_exec((const uint8_t *)&end); n0 = g_skb_n; mtl_exec(ops); rp_end(); mtl_sub_commit(); mtl_finish();
+      uint64_t d = g_skb_n - n0; MLOG("skin-order probe: B B A B B B added %llu barriers (expected %d)", (unsigned long long)d, skin_barrier() ? 1 : 0);
+      if (d != (uint64_t)(skin_barrier() ? 1 : 0)) MDIE("skin-order probe: B B A B B B added %llu barriers, expected %d", (unsigned long long)d, skin_barrier() ? 1 : 0);
+      checked++; }
+    memset(&R, 0, sizeof R); state_reset(); memset(&S.ssbo, 0, sizeof S.ssbo); g_skb_probe_off = 0;
+    for (int k = 0; k < 2; k++) serial_del(pg[k].serial);
+    serial_del(rt.serial); mtl_pool_del(x); free(x); defer_obj_release(rb); defer_obj_release(tex);
+    return checked;
 }
 
 /* Render through the same descriptor and stream-binding helper as draw_inner.
