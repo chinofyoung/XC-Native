@@ -65,6 +65,16 @@ static void apply_file(Module *m, const char *slug) {
      fadd). Neither reads GetFrameTime, so at 60 fps the ring ran out in half the time. Each load branches to a veneer that
      reloads speed and, in mode 1, multiplies it by frame time x 30 (one 30 fps frame's share), then goes back; mode 0
      keeps the shipped step. The frame-counted sound cue of the same class (+0x114) is not changed.
+   - Sites 5 and 6, the effect engine (the .wiefb particle effects; CHANGELOG "60 fps: effects, and the item that flies to
+     the player"): it steps every effect by a fixed amount a frame, in 30 fps frames, and never reads GetFrameTime. Its
+     update (v200 main+0x2896c0) takes the game speed (1.0; 0 while paused; main+0x289728 bl) as the step for the frame
+     and stores it twice (main+0x289734: stp s0, s0 -> main+0x1d81470 / +0x1d81474: each effect's frame counter and
+     emitters, and the particles' spin); effects that ignore the game speed use a fixed 1.0 instead (main+0x28695c, in
+     the calc main+0x286920). So at 60 fps every effect ran twice as fast, most visibly the item that flies from a
+     collectible or a treasure container to the player (the pickup handler main+0x150bd4 plays cmn_102_100.wiefb with the
+     player as its target). Site 5 is the add just before the store (main+0x289730), site 6 the fmov #1.0; each branches
+     to a veneer that runs the original word and, in mode 1, multiplies s0 by frame time x 30. The engine's own half
+     step (main+0x289748, a flag the port never sets) still applies after site 5.
    XCX_FPS60=0 with the patch keeps N = 2 and the original GetFrameTime (A/B in one build; iOS's "off"). On iOS code pages
    cannot be written at run time: ios/tools/build_ipa.py exports main's text with these sites patched (TOTK_EXPORT_IOS)
    and the device only checks that the patched words are there; the Settings switch picks the page's values. */
@@ -82,6 +92,27 @@ static void apply_file(Module *m, const char *slug) {
 #define FPS60_QTE_RING  0x5c5870ULL         /* 1.0.1: the class's code is the same, 0xa10 bytes earlier */
 #define FPS60_QTE_JUDGE 0x5c5aecULL
 #endif
+#if defined(XCX_GAME_V200)
+#define FPS60_FX_STEP   0x289730ULL         /* add x22, x22, #0x470: after the game speed, before stp s0, s0, [x22] */
+#define FPS60_FX_FIXED  0x28695cULL         /* fmov s0, #1.0: the step of effects that ignore the game speed */
+#else
+#define FPS60_FX_STEP   0x289290ULL         /* 1.0.1: the effect engine's code is the same, 0x4a0 bytes earlier */
+#define FPS60_FX_FIXED  0x2864bcULL
+#endif
+/* The effect engine's veneer (sites 5 and 6; scripts/verify_fps60_fx_patch.py runs it): word 0 is the site's own
+   instruction, word 1 the adrp and word 8 the branch back, filled in by fps60_fx. s0 is the step either way; x16, x17
+   and s1 are free at both sites (each follows a bl, and s1 is written before it is read). */
+static const uint32_t fps60_fx_veneer[9] = {
+    0,              /* add x22, x22, #0x470 | fmov s0, #1.0 (the site's original word) */
+    0,              /* adrp x16, <host page> */
+    0xb9400a11u,    /* ldr w17, [x16, #8]: mode */
+    0x340000b1u,    /* cbz w17, +20: mode 0 keeps the shipped step */
+    0xbd400201u,    /* ldr s1, [x16]: measured frame time */
+    0x1e210800u,    /* fmul s0, s0, s1 */
+    0x1e27d001u,    /* fmov s1, #30.0 */
+    0x1e210800u,    /* fmul s0, s0, s1 */
+    0,              /* b <site + 4> */
+};
 /* The prompt's veneer (sites 3 and 4; scripts/verify_fps60_qte_patch.py runs it): word 0 is the site's own load, word 1
    the adrp and word 8 the branch back, filled in by fps60_qte. x16, x17 and s2 are free at both sites. */
 static const uint32_t fps60_qte_veneer[9] = {
@@ -135,6 +166,13 @@ static void fps60_qte(Module *m, uint64_t ven, uint64_t site, uint32_t load, uin
     fps60_put(m, site, load, enc_branch(site, ven, 0), what);
     if (!CODE_PATCHED_AT_BUILD) { sys_icache_invalidate(m->base + ven, sizeof w); sys_icache_invalidate(m->base + site, 4); }
 }
+static void fps60_fx(Module *m, uint64_t ven, uint64_t site, uint32_t orig, uint64_t page, const char *what) {
+    uint32_t w[9]; memcpy(w, fps60_fx_veneer, sizeof w);
+    w[0] = orig; w[1] = enc_adrp(16, ven + 4, page); w[8] = enc_branch(ven + 32, site + 4, 0);
+    for (unsigned i = 0; i < 9; i++) fps60_put(m, ven + 4 * i, 0, w[i], "veneer (effect step)");
+    fps60_put(m, site, orig, enc_branch(site, ven, 0), what);
+    if (!CODE_PATCHED_AT_BUILD) { sys_icache_invalidate(m->base + ven, sizeof w); sys_icache_invalidate(m->base + site, 4); }
+}
 static void apply_fps60(Module *m) {
     const uint64_t page = (m->file_size + 0x3fff) & ~0x3fffULL;
     if (page + 0x4000 != m->size) runtime_fail("60 fps: host page layout");
@@ -146,9 +184,15 @@ static void apply_fps60(Module *m) {
     /* Checked only: the ring load before site 3, the fsub after it; the judge's ring load before site 4, the fadd after it. */
     if (word_at(m, qr - 0x14) != 0xbd411e60u || word_at(m, qr + 4) != 0x1e213800u ||
         word_at(m, qj - 0xc) != 0xbd411c00u || word_at(m, qj + 4) != 0x1e212800u) runtime_fail("60 fps: prompt timer code differs");
+    const uint64_t fs = FPS60_FX_STEP, ff = FPS60_FX_FIXED;
+    /* Checked only: the game-speed call two words before site 5 and the store after it; the fmov #0.5 after site 6 and
+       the tst of the half-step flag two words later. */
+    if (word_at(m, fs - 8) != 0x97ffa232u || word_at(m, fs + 4) != 0x2d0002c0u ||
+        word_at(m, ff + 4) != 0x1e2c1001u || word_at(m, ff + 0xc) != 0x7200001fu) runtime_fail("60 fps: effect step code differs");
     const uint64_t v0 = (m->text_end + 15) & ~15ULL, end = (m->text_end + 0xfff) & ~0xfffULL;
     const uint64_t v1 = v0 + 16;   /* veneer 1: 3 words (16 bytes slot); veneer 2: 8 words */
     const uint64_t v2 = v1 + 32, v3 = v2 + 48;   /* the prompt's veneers: 9 words each (48 bytes slots) */
+    const uint64_t v4 = v3 + 48, v5 = v4 + 48;   /* the effect engine's veneers: 9 words each */
     const uint32_t ven_vsync[3] = {enc_adrp(0, v0, page), 0xb9400400u /* ldr w0, [x0, #4] */, 0xd65f03c0u /* ret */};
     const uint32_t ven_ft[8] = {enc_adrp(16, v1, page),
                                 0xb9400a11u,                 /* ldr w17, [x16, #8]: mode */
@@ -157,7 +201,7 @@ static void apply_fps60(Module *m) {
                                 0xd65f03c0u,                 /* ret */
                                 0xa9be7bfdu,                 /* stp x29, x30, [sp, #-0x20]!  (GetFrameTime's first word) */
                                 enc_branch(v1 + 24, ft + 4, 0), 0};
-    if (v3 + sizeof fps60_qte_veneer > end) runtime_fail("60 fps: veneers reach read-only data");
+    if (v5 + sizeof fps60_fx_veneer > end) runtime_fail("60 fps: veneers reach read-only data");
     for (unsigned i = 0; i < 3; i++) fps60_put(m, v0 + 4 * i, 0, ven_vsync[i], "veneer (vsync count)");
     for (unsigned i = 0; i < 7; i++) fps60_put(m, v1 + 4 * i, 0, ven_ft[i], "veneer (frame time)");
     fps60_put(m, vsync, 0x52800040u, enc_branch(vsync, v0, 1), "vsync count (mov w0, #2)");
@@ -166,6 +210,8 @@ static void apply_fps60(Module *m) {
     if (!CODE_PATCHED_AT_BUILD) { sys_icache_invalidate(m->base + vsync, 4); sys_icache_invalidate(m->base + ft, 4); }
     fps60_qte(m, v2, qr, 0xbd412261u, page, "prompt ring step (ldr s1, [x19, #0x120])");
     fps60_qte(m, v3, qj, 0xbd412001u, page, "prompt judge (ldr s1, [x0, #0x120])");
+    fps60_fx(m, v4, fs, 0x9111c2d6u, page, "effect step (add x22, x22, #0x470)");
+    fps60_fx(m, v5, ff, 0x1e2e1000u, page, "effect fixed step (fmov s0, #1.0)");
     fps60_page = (Fps60Page *)(void *)(m->base + page);
     const char *e = getenv("XCX_FPS60"); fps60_on = !(e && !strcmp(e, "0"));
     float sixtieth = 1.0f / 60.0f; uint32_t bits; memcpy(&bits, &sixtieth, 4);
@@ -179,6 +225,9 @@ static void apply_fps60(Module *m) {
     fprintf(stderr, "[xcx] game patch 60fps (%s): timed B-button prompt %s; ring step main+%#llx, judge main+%#llx, veneers main+%#llx..+%#llx\n",
             TOTK_GAME_VERSION, fps60_on ? "on (step x frame time x 30)" : "off by XCX_FPS60=0 (shipped step)",
             (unsigned long long)qr, (unsigned long long)qj, (unsigned long long)v2, (unsigned long long)(v3 + sizeof fps60_qte_veneer));
+    fprintf(stderr, "[xcx] game patch 60fps (%s): effects %s; step main+%#llx, fixed step main+%#llx, veneers main+%#llx..+%#llx\n",
+            TOTK_GAME_VERSION, fps60_on ? "on (step x frame time x 30)" : "off by XCX_FPS60=0 (shipped step)",
+            (unsigned long long)fs, (unsigned long long)ff, (unsigned long long)v4, (unsigned long long)(v5 + sizeof fps60_fx_veneer));
 }
 
 void runtime_game_patches(Module *main_module) {

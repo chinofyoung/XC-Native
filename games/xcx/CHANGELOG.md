@@ -1517,3 +1517,61 @@ reads the bones in this scene. Frame rate with the fix, 1800-frame means: 57.7 f
 p50 8.73 ms / p95 10.60 ms, NVN submit plus present p50 1.41 ms. Before the fix (the 16:10 session) the same field ran
 57.6-58.8 fps, so no cost shows. **Not checked in the game:** an iPhone, update 1.0.1, other scenes with skinned meshes
 (only this field battle was watched), and a side by side frame rate with `XCX_SKIN_BARRIER=0` in the same session.
+
+### 2026-10-28: 60 fps: effects, and the item that flies to the player
+
+**Found** (static analysis of main 2.0.0 with capstone; owner's report: with the 60 fps patch the item that flies from a
+collectible or an opened treasure container to the character moved about twice as fast, normal at 30 fps): the item is
+an effect. The collectible pickup handler (main+0x15072c..) plays `cmn_102_100.wiefb` or `cmn_102_200.wiefb` (or
+`cmn_600_020`) at the item's position with the player as its target (main+0x150bd4, `bl 0x3506e8`: the effect system
+`[main+0x1e0b2d0]`, command 8 queued at main+0x273f70 and run at main+0x2872a0, which stores the target at instance
++0xe0); the treasure container's
+open handler (main+0x39264c) plays its effect through the same call (main+0x3927d8). That effect engine
+(main+0x271000..0x2b0000) never reads GetFrameTime or the field frame time (main+0x30fa8c); its only time input is the
+game speed. Its update (main+0x2896c0) reads the game speed (main+0x289728 `bl 0x271ff0` -> main+0x13cc78c:
+`[[main+0x1dbf108] + 0x254]`, 1.0, 0 while paused) and stores it as the frame's step (main+0x289734 `stp s0, s0` ->
+main+0x1d81470 and its copy +0x1d81474). The calc (main+0x286920) advances each effect's frame counter (+0x174) by its
+speed (+0xd4) x the step, or x a fixed 1.0 for effects flagged to ignore the game speed (+0xce; the 1.0 is main+0x28695c
+`fmov s0, #1.0`, held in s10), and passes the same amount to the emitters; the particles' spin uses the copy (angle +=
+spin x step, wrapped to +/-pi, main+0x296df8 and 14 more sites). The step is in 30 fps frames, so at 60 fps every effect
+of this engine ran twice as fast, not only the pickup. The engine has a half step of its own (main+0x289748: the step
+x 0.5 when the framework flag `[main+0x1df6020] + 0x301` is set, which also doubles the field frame time); the port never
+sets it, and it is left alone. The 2026-10-27 note had counted the pickup's particles as frame-time driven: the system it
+read (main+0x26b924, object main+0x1fefd00) is another one.
+
+**The patch** (`runtime/game_patches.c`, sites 5 and 6 of `60fps`, written by `apply_fps60` after the prompt's; each word
+checked first, a mismatch stops the start):
+
+| Site (2.0.0 / 1.0.1) | Original | Patched |
+|---|---|---|
+| step, +0x289730 / +0x289290 | `9111c2d6` add x22, x22, #0x470 (checked: the `bl` game speed 8 bytes before, `97ffa232`, and the `stp s0, s0, [x22]` after) | `b` veneer 5 |
+| fixed step, +0x28695c / +0x2864bc | `1e2e1000` fmov s0, #1.0 (checked: `fmov s1, #0.5` after, `tst w0, #1` at +0xc) | `b` veneer 6 |
+| veneers 5 and 6, +0x17350e0 / +0x1744e20 (84 bytes, after the prompt's) | zero padding (checked) | `<original>; adrp x16, page; ldr w17, [x16, #8]; cbz w17, 1f; ldr s1, [x16]; fmul s0, s0, s1; fmov s1, #30.0; fmul s0, s0, s1; 1: b site+4` |
+
+In mode 1 the step becomes game speed x frame time x 30 (and the fixed one frame time x 30), so an effect of L frames
+lasts L/30 s at any frame rate, and a paused game still freezes the effects that follow its speed. Mode 0 (30 fps,
+`XCX_FPS60=0`, iOS "30") runs the shipped step. x16, x17 and s1 are free at both sites (each follows a `bl`, and s1 is
+written before it is read). 1.0.1: the engine's code is the same 0x4a0 bytes earlier (found by matching the code with
+PC-relative operands masked; the original words, the `bl` included, are identical), and the rewrite leaves all four
+words as they are in both versions. The engine's frame accumulator (main+0x20d3de4) keeps one calc a frame with steps of
+0.5 to 1.5, as the runtime's frame time is held to 1/60..1/20 s.
+
+New log line, after the prompt's: `[xcx] game patch 60fps (2.0.0): effects on (step x frame time x 30); step
+main+0x289730, fixed step main+0x28695c, veneers main+0x17350e0..+0x1735134`. iOS: the export reports `main ...
+patched_words=52` (was 32).
+
+**Checked:** `scripts/verify_fps60_fx_patch.py` (new; Unicorn on `rewritten/<v>/main.patched.bin`, words parsed from
+game_patches.c) for 2.0.0 and 1.0.1, 86 checks each: it runs the real game-speed block (main+0x289728..0x289738, through
+the getter), the fixed-step block (main+0x286958..0x286974, through the flag getter) and the frame counter block
+(main+0x286d24..0x286da8) for effects of 8, 15, 30 and 45 frames, of both kinds. Shipped at 30 fps an effect of L frames
+ends on frame L; shipped at 60 fps in half the time (negative control); patched in mode 0 at 30 and 60 fps equals the
+shipped code bit for bit; patched at 20, 30, 45, 60 and 120 fps it ends within one frame of L/30 s; at 1/30 s a frame
+the counter matches the shipped one within float rounding; at game speed 0 and 0.5 mode 0 is bit for bit the shipped
+code and mode 1 at 60 fps reaches the 30 fps counter after 3 s (paused: 0 for effects that follow the speed). `--exported`
+against the text the runtime wrote (`export-ios`, both versions, `XCX_PATCHES=60fps XCX_FPS60=1`): the 20 words match,
+and the prompt's script still passes with its 20. `tests/test_fps60_fx_patch.py` (encodings, sites, padding);
+`python3.14 -m unittest discover -s games/xcx/tests`: 159 tests OK; `make runtime` for both versions. **Play-tested on
+Mac** (2.0.0, M1 MacBook Air, 2026-10-28, the `XCX_build` app): the item that flies to the character after a pickup or a
+treasure container looks right at 60 fps. Other effects (fire, battle arts, the Skell and UI effects) were not checked
+one by one; watch them for anything that now looks wrong. 1.0.1 and the iPhone were not played. The per-particle code of every emitter type was not read; the engine's own half step shows that
+it takes steps other than 1.0.

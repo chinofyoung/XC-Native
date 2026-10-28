@@ -247,6 +247,10 @@ simulates with is also 2/60 s, fixed, whatever the frame really took. The patch 
   intervals between presents, each held to 1/60..1/20 s) instead of a fixed 1/60 s, so the game keeps its speed when a
   frame takes longer than 1/60 s.
 
+It also corrects two parts of the game that count 30 fps frames instead of time, which ran twice as fast at 60 fps: the
+timed B-button prompt (the "Soul Challenge") and the effect engine (effects such as the item that flies to the
+character after a pickup or from a treasure container).
+
 Where to switch it: the Mac app's settings window (**Frame rate: 30 (original) / 60 (experimental)**, saved; `open --env
 XCX_FRAME_RATE=60 <app>` for one start), the iPhone / iPad Settings app (**Xenoblade Chronicles X › Frame rate**), or
 `XCX_PATCHES=60fps` for a run from the terminal (`XCX_FPS60=0` keeps the patch in place but runs the original 30 fps).
