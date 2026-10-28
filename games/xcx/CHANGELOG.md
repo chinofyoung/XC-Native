@@ -1653,3 +1653,105 @@ and the calls). `python3.14 -m unittest discover -s games/xcx/tests`: 182 tests 
 2.0.0): saves exported with the Mac launcher (M1 MacBook Air) imported on an iPhone 15 Pro Max through the start screen
 and the Files picker, and the game loaded them. Not checked by hand: an export from the iPhone (share sheet), an import
 on the Mac from the launcher window, the A button, and an iPad.
+
+### 2026-10-28: MetalFX scaling at 60 fps on an M1 (measured, no code change)
+
+**How it is wired.** The launcher's Scaling = MetalFX sets `TOTK_MFX_UPSCALE=1` and `TOTK_MFX_OUTPUT=1`. Three MetalFX
+**spatial** contexts exist (`totk_mfx_up.m`), no temporal one. Two of them replace a game draw and match only Tears of
+the Kingdom shader keys (`mfxup_dock`: a3a570eb / ac58fc18; the scene hook: 0ac9a549), so they never fire in this game.
+The one that works is the present stage (`output_upscale` in `nvn_mtl.m`): when the window or full screen shows the
+game's finished picture bigger than it is (by at least 16 x 9 pixels), MetalFX upscales it to the viewport (perceptual
+colour processing) instead of the bilinear stretch. The HUD is part of the game picture and is upscaled with it; the
+FPS box is drawn after. So MetalFX never lowers what the game renders: it only changes how the picture is enlarged, and
+it costs GPU time. The game's own render size changes only with Rendering (docked 1920x1080 output, handheld 1280x720).
+
+**Measured** (MacBook Air M1 8-core GPU, 16 GB, macOS 26; 2.0.0, dev runtime `XCX_build/build/xcx-native-v200`;
+`XCX_PATCHES=60fps XCX_FPS60=1`; window 1280x720 points on the built-in display = 2560x1440 drawable, the owner's
+saved size; a copy of the app profile, Continue with J at 45 / 55 s; East Gate Plain at 08:34, party standing still,
+no input). In each process the output stage was switched off and on (`flag mfx_output 0|1` in `TOTK_INPUT_FILE`) in
+three pairs of 20 s windows, 4 s dropped at each edge; per-frame `@frame_ms` / `@gpu_ms` from `DM_NVN_TSV`.
+
+| Rendering | Scaling | Picture -> output | Frames | Mean fps | Frame p50 / p95 ms | GPU p50 / p95 ms |
+|---|---|---|---|---|---|---|
+| Docked | Plain | 1920x1080 -> 2560x1440 | 1653 | 45.9 | 20.48 / 26.31 | 18.91 / 23.69 |
+| Docked | MetalFX | 1920x1080 -> 2560x1440 | 1639 | 45.5 | 21.18 / 24.87 | 19.21 / 22.50 |
+| Handheld | Plain | 1280x720 -> 2560x1440 | 2129 | 59.1 | 16.61 / 17.49 | 10.84 / 12.36 |
+| Handheld | MetalFX | 1280x720 -> 2560x1440 | 2090 | 58.1 | 16.63 / 17.77 | 10.85 / 13.19 |
+
+- The MetalFX upscale itself (its own timestamps, `出图放大` line): GPU p50 1.63 / p95 2.74 ms docked, 1.91-1.99 /
+  3.01-3.06 ms handheld. Docked without the first (warm-up) pair: plain 48.0 fps, MetalFX 46.9 fps.
+- Handheld: the first MetalFX window had the only hitches (55.8 fps; the first encode took 2.3-4.8 ms on the present
+  thread); the other two MetalFX windows ran 58.7 and 59.7 fps, the same as plain. The game's frame step line: 58.3-59.1
+  fps in every 1800 frames.
+- Title screen (docked, same settings, an earlier run without a save): plain 41.8 fps (GPU p50 21.4 ms), MetalFX 34.1
+  fps (GPU p50 23.1 ms).
+- Pictures (`docs/screenshots/xcx-60fps-{docked,handheld}-{plain,metalfx}.png`, window captures): MetalFX is clearly
+  sharper than plain at handheld's 2x enlargement (grass, armour edges, HUD text), with slight ringing on grass; at
+  docked's 1.33x the difference is small. No wrong size, garbage or misplaced HUD. Handheld also draws less vegetation
+  than docked at the same spot (the game's own handheld detail), not only fewer pixels.
+
+**Not checked:** full screen (3360x2100 on this display; a larger enlargement costs more), the night scene in
+Primordia used before, battles, a long run on a hot Air (these runs were 4 minutes each, about 1 minute apart), 1.0.1.
+Presets and defaults are unchanged.
+
+### 2026-10-28: the game closed after choosing a division (nn::time functions left to the SDK)
+
+**Symptom.** On a Mac (2.0.0, dev app), about 17 minutes in, right after choosing a division and tracking the quest
+Vandham gives next, the game closed. The log ended with `[totk] guest Break reason=0`, caller
+`sdk+0x42d2fc` (in `nn::time::ClaimPeriodicBenefitWithUserSystemClock`) from `main+0x13ca180`, and
+`FAIL: original SDK Break`.
+
+**Cause.** `runtime/time_host.c` answers nn::time with the host clock, but only for the functions it lists. Main
+imports 19 nn::time functions (1.0.1 and 2.0.0 alike) and 10 were not listed; those ran the SDK's own code, which
+first checks the time service global (`[sdk 0xb75570]`, never set on the host) and aborts when it is null
+(`bl 0x62f290`). Choosing a division starts the game's real-time division reward: main 0x13ca098 keeps a 0x300-byte
+`PeriodicBenefitClaimContext` (saved with the game), makes a snapshot and calls the claim, the first of the 10 to be
+reached.
+
+**The SDK's claim, read from sdk 0x42f280 and 0x42f740** (the public function at 0x42d290 only checks the global and
+jumps there). Context: +0x000 the previous claim's snapshot (type byte 0 = new context), +0x0d0 the snapshot of the
+last claim that gave the benefit, +0x1a0 the penalty end (a steady clock time point; source 0 = none), +0x1b8 "the
+penalty was the full length". Arguments: the longest penalty (main: N minutes) and how far the local clock may move
+forward without one (main: M seconds), and the game's callback object (slot 0: same period as the last benefit; slot
+1: receivable now; main's compares the day and an N-minute slot). Steps: a new context is reset; a different steady
+clock source clears the penalty when both snapshots have a valid network clock, else sets one (the full length less
+the time since the last benefit); on the same source, a change of the local clock by the user or the time zone
+(backward any amount, forward beyond the allowance) sets a penalty from when the change happened, keeping a later one.
+Then: penalty still running gives 2; else the same period gives 1 (skipped once after a full penalty), the callback
+refusing gives 1, otherwise 0 and the snapshot is kept as the last benefit. Every call stores the snapshot as the
+previous one. The SDK reaches the time service in two corners (automatic correction toggled, location changed), so
+the host reproduces the logic in C rather than running the SDK's.
+
+**Fix** (`runtime/time_host.c`):
+- `ClaimPeriodicBenefitWithUserSystemClock`: the SDK's logic above, calling the game's callback as the SDK does.
+- Snapshots: `CreateWithStandardSystemClock` now sets type 1, as the SDK asks the service for (sdk 0x42de80); with
+  type 0 every claim would have looked like a new context and given the benefit each time. `ClockSnapshot()` now
+  fills what the SDK's constructor does (1970-01-01, Thursday, "UTC").
+- `CalculateSpanBetween` returns a bool, as the SDK's does (sdk 0x42d5c8) and main tests it (main 0x13cc080); the host
+  returned 0 for success, so main always saw "no span". It now also uses the network clock when the steady clock
+  source differs (a game restart: the host's source is new in each process). Main uses it at 0x17b1b0 and 0x5051d0
+  (time elapsed since a stored snapshot).
+- `CalculateStandardUserSystemClockDifferenceByUser`: 0 when automatic correction is on in both snapshots (always on
+  the host), the time service's rule.
+- `operator-(CalendarTime, TimeSpan)` (used by the game's callback): UTC arithmetic like sdk 0x42db50.
+- `StandardNetworkSystemClock::IsAccuracySufficient`: true; the network clock is the NTP-synchronised host clock,
+  which its `GetCurrentTime` and `now()` already answer with.
+- `AsyncEnsureNetworkClockAvailabilityTask` (main 0xc945f0, the online layer): the SDK's object layout (event at +8,
+  initialised byte at +0x90); `Initialize` makes the event with the SDK's `CreateSystemEvent`, `StartTask` accepts and
+  signals it at once, `GetResult` answers network unavailable (nifm 110 / 300, as `system_services.c`), the destructor
+  destroys the event. Main then logs its own error and stays offline.
+- `ToCalendarTime` with a `TimeZoneRule`: fails loudly (`runtime_fail` naming it). The host cannot read the SDK's rule
+  blob; main never loads a rule and its only caller (main 0xbe8ce0) passes none.
+
+**Checked.** `tests/test_time_host.py` compiles `time_host.c` with a C program: every nn::time import of main has a
+host version (a fixed list, and the generated tables of both versions in the work folder: the same 19); the claim
+through a new context, same day, next day, a game restart, a time zone move west (one-hour penalty), east within and
+beyond the allowance (full penalty, then the benefit without the same-day check), a refusing callback, and a steady
+clock reset without a network clock (600 s less 100 s elapsed); snapshots, spans, the user difference, calendar
+subtraction and the network task. `python3.14 -m unittest discover -s games/xcx/tests`: 186 tests OK.
+`make runtime VERSION=v200` and `VERSION=v101` build clean with `-Werror`. SDK code of 1.0.1 and 2.0.0 is the same
+(sdk.patched.bin identical).
+
+**Play-tested on Mac** (2.0.0, M1 MacBook Air, 2026-10-28, the owner's save past the division choice): the game no
+longer closes after tracking Vandham's quest, and play continued into Chapter 3. Not checked: the division reward
+appearing in game on its schedule; iPhone.
