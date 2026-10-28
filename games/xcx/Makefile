@@ -110,11 +110,11 @@ launcher: $(LAUNCHER)
 icon: $(OUT)/AppIcon.icns
 # dmsh_chain.h: the shader cache's name, which a self-contained app keeps in the user's Library; totk_shader_contrib.h:
 # the share reminder and the contribution file; game_version.h: the version the launcher's --check compares with
-# Info.plist
-$(LAUNCHER): app/launcher.m third_party/d2r_gfx/gfx/nvn/dmsh_chain.h third_party/d2r_gfx/gfx/nvn/totk_shader_contrib.h \
+# Info.plist; xcx_saves.m: Export / Import Saves (zlib for the zip)
+$(LAUNCHER): app/launcher.m app/xcx_saves.m app/xcx_saves.h third_party/d2r_gfx/gfx/nvn/dmsh_chain.h third_party/d2r_gfx/gfx/nvn/totk_shader_contrib.h \
              runtime/game_version.h Makefile
 	@mkdir -p "$(dir $@)"
-	xcrun clang -std=gnu11 -O2 -Wall -Wextra -Werror -fobjc-arc $(VERSION_FLAGS) -Ithird_party/d2r_gfx/gfx/nvn -Iruntime app/launcher.m -framework Cocoa -o "$@"
+	xcrun clang -std=gnu11 -O2 -Wall -Wextra -Werror -fobjc-arc $(VERSION_FLAGS) -Ithird_party/d2r_gfx/gfx/nvn -Iruntime app/launcher.m app/xcx_saves.m -framework Cocoa -framework UniformTypeIdentifiers -lz -o "$@"
 $(OUT)/AppIcon.icns:
 	@if [ -n "$(GAME)" ] && [ -n "$(KEYS)" ]; then cd scripts && "$(PY)" extract_app_icon.py "$(GAME)" --keys "$(KEYS)" --title 0100453019aa8000 $(if $(TITLE_KEYS),--title-keys "$(TITLE_KEYS)") --output "$(abspath $@)"; \
 	 else echo "no GAME= / KEYS=: the app gets no icon"; fi

@@ -37,12 +37,18 @@
    next to the binary (<work>/build/shader-cache/rt-*), so it and make boot share it.
    Shaders the shared shader list lacks: the game notes them in <data>/shader-list-contribution.txt (TOTK_SHADER_CONTRIB);
    before the game starts the launcher asks, at 50 and then every 500 more, to share the file (contrib_reminder).
+   Saves: Export Saves... writes this Mac's saves into one zip, Import Saves... replaces them with a zip's after copying
+   the profile to profile-<version>-backup-<date> (app/xcx_saves.h, shared with the iPhone app); neither while the game
+   runs. --export-saves <zip> / --import-saves <zip> do the same without the window, for scripted checks
+   (TOTK_PROFILE_DIR from the environment names another profile).
    Until 2026-10-24 the data and log folders were MacNativeGames' (Application Support/MacNativeGames/XCX,
    Logs/MacNativeGames): the first start moves them (use_library). */
 #import <Cocoa/Cocoa.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include "dmsh_chain.h"      /* DMSH_CHAIN: the shader cache's name (third_party/d2r_gfx/gfx/nvn) */
 #include "game_version.h"    /* TOTK_GAME_VERSION, TOTK_GAME_DIR (runtime/) */
 #include "totk_shader_contrib.h"   /* the shared shader list contribution and its reminder (third_party/d2r_gfx/gfx/nvn) */
+#include "xcx_saves.h"       /* save export / import (app/) */
 #include <errno.h>
 #include <libproc.h>
 #include <stdio.h>
@@ -92,6 +98,13 @@ static NSString *g_data, *g_logs;
 static NSString *in_home(NSString *sub) { return [NSHomeDirectory() stringByAppendingPathComponent:sub]; }
 static NSString *data_folder(void) { return g_data ?: in_home(DATA_FOLDER); }
 static NSString *logs_folder(void) { return g_logs ?: in_home(LOGS_FOLDER); }
+/* The player's profile (account, saves): <data>/profile, or TOTK_PROFILE_DIR from the environment (scripted checks). */
+static NSString *profile_folder(void) {
+    const char *e = getenv("TOTK_PROFILE_DIR");
+    return e && *e ? @(e) : [data_folder() stringByAppendingPathComponent:@"profile"];
+}
+static BOOL game_running(void);
+static NSString *computer_name(void) { return NSHost.currentHost.localizedName ?: @"Mac"; }
 /* RomFS mods: <work>/../mods/<name>/romfs with a manifest.tsv (make mods); a self-contained app: <data>/mods. */
 static NSString *mods_folder(void) {
     return self_contained() ? [data_folder() stringByAppendingPathComponent:@"mods"]
@@ -110,7 +123,7 @@ static NSString *screen_name(NSScreen *s) { return s.localizedName ?: @"?"; }
 @property NSWindow *window;
 @property NSPopUpButton *preset, *size, *monitor, *output, *mod, *fps;
 @property NSSegmentedControl *display, *scaler, *rendering;
-@property NSButton *hud, *play; @property NSTextField *note;
+@property NSButton *hud, *play, *exportSaves, *importSaves; @property NSTextField *note;
 @property NSArray<NSString *> *mods; @property BOOL applying, launch;
 @end
 
@@ -144,6 +157,9 @@ static NSString *screen_name(NSScreen *s) { return s.localizedName ?: @"?"; }
     self.hud = [NSButton checkboxWithTitle:T("Mostrar FPS y resolución (tecla 1 lo oculta)", "Show FPS and resolution (key 1 hides it)") target:self action:@selector(changed:)];
     self.note = [NSTextField wrappingLabelWithString:@""]; self.note.textColor = NSColor.secondaryLabelColor; self.note.font = [NSFont systemFontOfSize:11];
     self.play = [NSButton buttonWithTitle:T("Jugar", "Play") target:self action:@selector(start:)]; self.play.keyEquivalent = @"\r";
+    self.exportSaves = [NSButton buttonWithTitle:T("Exportar partidas…", "Export Saves…") target:self action:@selector(exportSaves:)];
+    self.importSaves = [NSButton buttonWithTitle:T("Importar partidas…", "Import Saves…") target:self action:@selector(importSaves:)];
+    NSStackView *saves = [NSStackView stackViewWithViews:@[self.exportSaves, self.importSaves]];
     NSButton *quit = [NSButton buttonWithTitle:T("Salir", "Quit") target:NSApp action:@selector(terminate:)]; quit.keyEquivalent = @"\033";
 
     NSGridView *grid = [NSGridView gridViewWithViews:@[
@@ -157,6 +173,7 @@ static NSString *screen_name(NSScreen *s) { return s.localizedName ?: @"?"; }
         @[[self label:T("Escalado", "Scaling")], self.scaler],
         @[[self label:T("Mod de interfaz", "Interface mod")], self.mod],
         @[[self label:T("Información", "Info")], self.hud],
+        @[[self label:T("Partidas", "Saves")], saves],
     ]];
     grid.rowSpacing = 10; grid.columnSpacing = 12; [grid columnAtIndex:0].xPlacement = NSGridCellPlacementTrailing;
     NSStackView *buttons = [NSStackView stackViewWithViews:@[quit, self.play]];
@@ -236,7 +253,84 @@ static NSString *screen_name(NSScreen *s) { return s.localizedName ?: @"?"; }
         [s appendString:T("60 imágenes por segundo es experimental: el juego va a la velocidad correcta también por debajo de 60, pero algunos efectos y animaciones pueden ir algo lentos entonces. En un Mac lento la GPU no llega a 60.",
                           "60 fps is experimental: the game keeps its speed below 60 too, but some effects and animations can run a little slow then. A slower Mac's GPU does not reach 60.")];
     }
+    /* The saves are not exported or replaced while a game (this app's or a terminal run) may be writing them. */
+    BOOL running = game_running();
+    self.exportSaves.enabled = self.importSaves.enabled = !running;
+    if (running) {
+        if (s.length) [s appendString:@" "];
+        [s appendString:T("El juego está abierto: ciérralo para exportar o importar partidas.", "The game is running: quit it to export or import saves.")];
+    }
     self.note.stringValue = s; self.note.hidden = !s.length;
+}
+- (void)windowDidBecomeKey:(NSNotification *)n { (void)n; [self refresh]; }
+- (void)tell:(NSString *)title info:(NSString *)info style:(NSAlertStyle)style {
+    NSAlert *a = [NSAlert new]; a.messageText = title; a.informativeText = info ?: @""; a.alertStyle = style;
+    [a beginSheetModalForWindow:self.window completionHandler:nil];
+}
+- (BOOL)gameStopped {
+    if (!game_running()) return YES;
+    [self tell:T("El juego está abierto", "The game is running") info:T("Ciérralo antes de exportar o importar partidas.", "Quit it before you export or import saves.") style:NSAlertStyleWarning];
+    [self refresh];
+    return NO;
+}
+- (void)exportSaves:(id)sender {
+    (void)sender;
+    if (![self gameStopped]) return;
+    NSString *profile = profile_folder();
+    if (!xcx_saves_list(profile).count) { [self tell:T("No hay partidas", "No saves") info:T("Todavía no hay partidas que exportar.", "There are no saves to export yet.") style:NSAlertStyleInformational]; return; }
+    NSSavePanel *panel = [NSSavePanel savePanel];
+    panel.nameFieldStringValue = xcx_saves_file_name([NSDate date]);
+    panel.allowedContentTypes = @[UTTypeZIP];
+    panel.message = T("Las partidas de este Mac, en un zip que otro Mac o un iPhone puede importar.", "This Mac's saves, in one zip another Mac or an iPhone can import.");
+    [panel beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse r) {
+        if (r != NSModalResponseOK) return;
+        [panel orderOut:nil];
+        NSError *err = nil;
+        if (![self gameStopped]) return;
+        if (xcx_saves_export(profile, panel.URL.path, @TOTK_GAME_DIR, computer_name(), &err))
+            [self tell:T("Partidas exportadas", "Saves exported") info:panel.URL.path style:NSAlertStyleInformational];
+        else [self tell:T("No se exportaron las partidas", "The saves were not exported") info:err.localizedDescription style:NSAlertStyleWarning];
+    }];
+}
+- (void)importSaves:(id)sender {
+    (void)sender;
+    if (![self gameStopped]) return;
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+    panel.allowedContentTypes = @[UTTypeZIP]; panel.canChooseDirectories = NO; panel.allowsMultipleSelection = NO;
+    panel.message = T("Elige un zip de partidas (XCX-saves-….zip).", "Choose a saves zip (XCX-saves-….zip).");
+    [panel beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse r) {
+        if (r != NSModalResponseOK) return;
+        [panel orderOut:nil];
+        dispatch_async(dispatch_get_main_queue(), ^{ [self importFrom:panel.URL.path]; });
+    }];
+}
+- (void)importFrom:(NSString *)zip {
+    NSError *err = nil;
+    NSDictionary *m = xcx_saves_inspect(zip, @TOTK_GAME_DIR, &err);
+    if (!m) { [self tell:T("No se importaron las partidas", "The saves were not imported") info:err.localizedDescription style:NSAlertStyleWarning]; return; }
+    NSDate *when = xcx_saves_export_date(m);
+    NSString *date = when ? [NSDateFormatter localizedStringFromDate:when dateStyle:NSDateFormatterMediumStyle timeStyle:NSDateFormatterShortStyle] : @"?";
+    NSAlert *ask = [NSAlert new];
+    ask.messageText = T("¿Importar estas partidas?", "Import these saves?");
+    ask.informativeText = [NSString stringWithFormat:T("Sustituye tus partidas actuales. Antes se hace una copia de seguridad.\n\nDe: %@\nExportadas: %@\nVersión del juego: %@",
+                                                       "This replaces your current saves. A backup is made first.\n\nFrom: %@\nExported: %@\nGame version: %@"),
+                           m[@"device"], date, m[@"game_version_name"] ?: m[@"game_version"]];
+    [ask addButtonWithTitle:T("Importar", "Import")];
+    [ask addButtonWithTitle:T("Cancelar", "Cancel")];
+    [ask beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse r) {
+        if (r != NSAlertFirstButtonReturn) return;
+        [ask.window orderOut:nil];
+        if (![self gameStopped]) return;
+        NSString *backup = nil; NSError *ierr = nil;
+        if (!xcx_saves_import(profile_folder(), zip, @TOTK_GAME_DIR, &backup, nil, &ierr)) {
+            [self tell:T("No se importaron las partidas", "The saves were not imported") info:ierr.localizedDescription style:NSAlertStyleWarning];
+            return;
+        }
+        [self tell:T("Partidas importadas", "Saves imported")
+              info:backup ? [NSString stringWithFormat:T("Tus partidas anteriores están copiadas en %@.", "Your previous saves were copied to %@."), backup.stringByAbbreviatingWithTildeInPath]
+                          : T("No había partidas anteriores que copiar.", "There were no previous saves to back up.")
+             style:NSAlertStyleInformational];
+    }];
 }
 - (void)save {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
@@ -367,6 +461,19 @@ int main(int argc, char **argv) {
             printf("%s: game version %s (%s)\n", ok ? "ok" : "missing game binary or version mismatch", TOTK_GAME_VERSION, TOTK_GAME_DIR);
             return ok ? 0 : 1;
         }
+        /* --export-saves <zip> / --import-saves <zip>: the window's Export Saves / Import Saves without it, for scripted
+           checks (TOTK_PROFILE_DIR names the profile; prints the result, exit 0 when done). */
+        if (argc > 2 && (!strcmp(argv[1], "--export-saves") || !strcmp(argv[1], "--import-saves"))) {
+            if (!(getenv("TOTK_PROFILE_DIR") && *getenv("TOTK_PROFILE_DIR"))) use_library();
+            if (game_running()) { printf("refused: the game is running\n"); return 1; }
+            NSString *profile = profile_folder(), *zip = @(argv[2]), *backup = nil, *folder = nil; NSError *err = nil;
+            BOOL ok = !strcmp(argv[1], "--export-saves") ? xcx_saves_export(profile, zip, @TOTK_GAME_DIR, computer_name(), &err)
+                                                          : xcx_saves_import(profile, zip, @TOTK_GAME_DIR, &backup, &folder, &err);
+            if (!ok) { printf("refused: %s\n", err.localizedDescription.UTF8String); return 1; }
+            if (folder) printf("imported into %s; backup %s\n", folder.UTF8String, backup ? backup.UTF8String : "(no saves before)");
+            else printf("exported %s\n", zip.UTF8String);
+            return 0;
+        }
         use_library();   // before anything reads the data folder (the settings window lists its mods)
         [NSApplication sharedApplication]; NSApp.activationPolicy = NSApplicationActivationPolicyRegular;
         Launcher *l = [Launcher new]; NSApp.delegate = l;
@@ -378,7 +485,7 @@ int main(int argc, char **argv) {
         BOOL bundled = self_contained();
         NSString *data = data_folder();
         NSString *logs = logs_folder();
-        NSString *profile = [data stringByAppendingPathComponent:@"profile"], *slot = [data stringByAppendingPathComponent:@"game-slot"];
+        NSString *profile = profile_folder(), *slot = [data stringByAppendingPathComponent:@"game-slot"];
         /* A self-contained app keeps what the game writes out of its signed bundle (Tears of the Kingdom's app does the
            same): the shader cache in the user's Library, and its own RomFS check record (the record names the image's
            file identity, and the app's image is another file than a work folder's, so the two kinds of app do not

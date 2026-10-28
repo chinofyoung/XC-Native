@@ -6,6 +6,8 @@
 #import <UIKit/UIKit.h>
 #import <AVFAudio/AVFAudio.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <GameController/GameController.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -17,6 +19,7 @@
 #include "romfs_config.h"   // ROMFS_IMAGE_SIZE: the build's image (generated, <work>/build/<v>)
 #include "game_version.h"   // TOTK_GAME_DIR (XCX_VERSION_FLAGS: -DXCX_GAME_V101 / V200)
 #import "touch_pad.h"
+#import "xcx_saves.h"       // save export / import, shared with the Mac launcher (app/xcx_saves.h)
 
 int totk_host_main(int argc, char **argv);
 void runtime_ios_attach_layer(CAMetalLayer *layer, UIView *host);
@@ -27,6 +30,9 @@ __attribute__((weak)) void runtime_audio_output_restart(int recreate) {
 }
 static char *host_argv[3];
 static NSString *g_no_game_data;   // set when there is no RomFS image to play from (didFinishLaunching)
+static BOOL g_skip_start_screen;   // a test launch from the Mac: straight into the game (didFinishLaunching)
+static NSString *g_skip_reason;    // the variable that made it skip (logged once log.txt is open)
+static NSString *g_profile;        // TOTK_PROFILE_DIR: Documents/save (didFinishLaunching)
 static void *run_host(void *unused) { (void)unused; return (void *)(intptr_t)totk_host_main(3, host_argv); }
 /* The desktop keyboard-overlay shortcut has no counterpart on iOS. */
 void runtime_shortcut_help_toggle(void) {}
@@ -76,6 +82,174 @@ void runtime_shortcut_help_toggle(void) {}
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
 @end
 
+/* The start screen: Play, Export Saves, Import Saves (as the Mac launcher's Saves row, app/launcher.m). The game runs in
+   this process and cannot be stopped and started again, so the saves are only exported or replaced here, before Play
+   starts it; after Play the screen is gone. Export writes the zip (xcx_saves_export) to the temporary folder and hands it
+   to the share sheet (Save to Files, AirDrop, ...); Import takes a zip from the Files picker (a copy), shows what it
+   holds (xcx_saves_inspect) and on Import backs Documents/save up to Documents/save-<version>-backup-<date> (in the Files
+   app) and replaces the saves (xcx_saves_import). A test launch skips the screen (g_skip_start_screen). A controller's
+   A button presses Play. */
+@interface XCXStartController : UIViewController <UIDocumentPickerDelegate>
+@property(nonatomic,strong) UIButton *play, *exportSaves, *importSaves;
+@property(nonatomic,strong) UILabel *note;
+@property(nonatomic,strong) UIActivityIndicatorView *spinner;
+@end
+@implementation XCXStartController
+static NSString *app_name(void) { return [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleDisplayName"] ?: @"Xenoblade Chronicles X"; }
+- (UIButton *)button:(NSString *)title primary:(BOOL)primary action:(SEL)action {
+    UIButtonConfiguration *c = primary ? UIButtonConfiguration.filledButtonConfiguration : UIButtonConfiguration.grayButtonConfiguration;
+    c.title = title; c.cornerStyle = UIButtonConfigurationCornerStyleLarge;
+    c.titleTextAttributesTransformer = ^NSDictionary *(NSDictionary *in) {
+        NSMutableDictionary *out = in.mutableCopy; out[NSFontAttributeName] = [UIFont systemFontOfSize:primary ? 26 : 17 weight:primary ? UIFontWeightBold : UIFontWeightSemibold]; return out; };
+    UIButton *b = [UIButton buttonWithConfiguration:c primaryAction:nil];
+    [b addTarget:self action:action forControlEvents:UIControlEventPrimaryActionTriggered];
+    b.translatesAutoresizingMaskIntoConstraints = NO;
+    return b;
+}
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = UIColor.blackColor;
+    self.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+    UILabel *title = [UILabel new]; title.text = app_name(); title.textColor = UIColor.whiteColor;
+    title.font = [UIFont systemFontOfSize:28 weight:UIFontWeightBold]; title.textAlignment = NSTextAlignmentCenter; title.adjustsFontSizeToFitWidth = YES;
+    self.play = [self button:@"Play" primary:YES action:@selector(play:)];
+    self.exportSaves = [self button:@"Export Saves" primary:NO action:@selector(exportSaves:)];
+    self.importSaves = [self button:@"Import Saves" primary:NO action:@selector(importSaves:)];
+    UIStackView *saves = [[UIStackView alloc] initWithArrangedSubviews:@[self.exportSaves, self.importSaves]];
+    saves.spacing = 16; saves.distribution = UIStackViewDistributionFillEqually;
+    self.note = [UILabel new]; self.note.textColor = UIColor.lightGrayColor; self.note.font = [UIFont systemFontOfSize:14];
+    self.note.numberOfLines = 0; self.note.textAlignment = NSTextAlignmentCenter;
+    self.spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+    self.spinner.color = UIColor.whiteColor; self.spinner.hidesWhenStopped = YES;
+    UIStackView *all = [[UIStackView alloc] initWithArrangedSubviews:@[title, self.play, saves, self.spinner, self.note]];
+    all.axis = UILayoutConstraintAxisVertical; all.alignment = UIStackViewAlignmentCenter; all.spacing = 18;
+    [all setCustomSpacing:28 afterView:title];
+    all.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:all];
+    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [all.centerXAnchor constraintEqualToAnchor:safe.centerXAnchor], [all.centerYAnchor constraintEqualToAnchor:safe.centerYAnchor],
+        [all.widthAnchor constraintLessThanOrEqualToAnchor:safe.widthAnchor constant:-32],
+        [all.topAnchor constraintGreaterThanOrEqualToAnchor:safe.topAnchor constant:8],
+        [title.widthAnchor constraintLessThanOrEqualToAnchor:all.widthAnchor],
+        [self.play.widthAnchor constraintEqualToConstant:336], [self.play.heightAnchor constraintEqualToConstant:64],
+        [saves.widthAnchor constraintEqualToAnchor:self.play.widthAnchor], [self.exportSaves.heightAnchor constraintEqualToConstant:44],
+        [self.importSaves.heightAnchor constraintEqualToAnchor:self.exportSaves.heightAnchor],
+        [self.note.widthAnchor constraintLessThanOrEqualToConstant:560], [self.note.widthAnchor constraintLessThanOrEqualToAnchor:all.widthAnchor],
+    ]];
+    for (GCController *c in GCController.controllers) [self watchController:c];
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(controllerConnected:) name:GCControllerDidConnectNotification object:nil];
+    [self refresh];
+}
+- (void)dealloc { [NSNotificationCenter.defaultCenter removeObserver:self]; }
+- (void)controllerConnected:(NSNotification *)n { [self watchController:n.object]; }
+- (void)watchController:(GCController *)c {
+    __weak XCXStartController *weak = self;
+    c.extendedGamepad.buttonA.pressedChangedHandler = ^(GCControllerButtonInput *b, float v, BOOL pressed) {
+        (void)b; (void)v;
+        XCXStartController *me = weak;
+        if (pressed && me && me.play.enabled && !me.presentedViewController && me.view.window) [me play:nil];
+    };
+}
+- (void)refresh {
+    BOOL busy = self.spinner.isAnimating;
+    NSUInteger saves = xcx_saves_list(g_profile).count;
+    self.play.enabled = !g_no_game_data && !busy;
+    self.exportSaves.enabled = saves > 0 && !busy;
+    self.importSaves.enabled = !busy;
+    NSMutableArray *lines = [NSMutableArray array];
+    if (g_no_game_data) [lines addObject:g_no_game_data];
+    if (!saves) [lines addObject:@"There are no saves to export yet."];
+    self.note.text = [lines componentsJoinedByString:@"\n\n"]; self.note.hidden = !lines.count;
+}
+- (void)tell:(NSString *)title info:(NSString *)info {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:title message:info preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+/* Runs work off the main thread (the backup copies the profile) with the buttons off, then done on the main thread. */
+- (void)busy:(id (^)(NSError **))work done:(void (^)(id result, NSError *err))done {
+    [self.spinner startAnimating]; [self refresh];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSError *err = nil; id result = work(&err);
+        dispatch_async(dispatch_get_main_queue(), ^{ [self.spinner stopAnimating]; [self refresh]; done(result, err); });
+    });
+}
+- (void)play:(id)sender {
+    (void)sender;
+    if (g_no_game_data || self.spinner.isAnimating) return;
+    for (GCController *c in GCController.controllers) c.extendedGamepad.buttonA.pressedChangedHandler = nil;   // the game reads the pad itself
+    [NSNotificationCenter.defaultCenter removeObserver:self];
+    UIWindow *window = self.view.window;
+    fprintf(stderr, "[xcx] start screen: Play\n");
+    window.rootViewController = [XCXGameController new];
+}
+- (void)exportSaves:(id)sender {
+    (void)sender;
+    NSString *zip = [NSTemporaryDirectory() stringByAppendingPathComponent:xcx_saves_file_name([NSDate date])];
+    NSString *device = UIDevice.currentDevice.name.length ? UIDevice.currentDevice.name : UIDevice.currentDevice.model;
+    [self busy:^id(NSError **err) {
+        [NSFileManager.defaultManager removeItemAtPath:zip error:nil];
+        return xcx_saves_export(g_profile, zip, @TOTK_GAME_DIR, device, err) ? zip : nil;
+    } done:^(id result, NSError *err) {
+        if (!result) { [self tell:@"The saves were not exported" info:err.localizedDescription]; return; }
+        fprintf(stderr, "[xcx] start screen: exported %s\n", zip.UTF8String);
+        UIActivityViewController *share = [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:zip]] applicationActivities:nil];
+        share.popoverPresentationController.sourceView = self.exportSaves;   // iPad: the sheet points at the button
+        share.popoverPresentationController.sourceRect = self.exportSaves.bounds;
+        share.completionWithItemsHandler = ^(UIActivityType type, BOOL completed, NSArray *items, NSError *error) {
+            (void)type; (void)completed; (void)items; (void)error;
+            [NSFileManager.defaultManager removeItemAtPath:zip error:nil];
+        };
+        [self presentViewController:share animated:YES completion:nil];
+    }];
+}
+- (void)importSaves:(id)sender {
+    (void)sender;
+    UIDocumentPickerViewController *pick = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeZIP] asCopy:YES];
+    pick.delegate = self; pick.allowsMultipleSelection = NO;
+    [self presentViewController:pick animated:YES completion:nil];
+}
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    (void)controller;
+    NSString *zip = urls.firstObject.path;   // a copy in the app's temporary folder (asCopy:YES), removed when done
+    if (zip) dispatch_async(dispatch_get_main_queue(), ^{ [self confirmImport:zip]; });   // once the picker is gone
+}
+- (void)confirmImport:(NSString *)zip {
+    NSError *err = nil;
+    NSDictionary *m = xcx_saves_inspect(zip, @TOTK_GAME_DIR, &err);
+    if (!m) { [NSFileManager.defaultManager removeItemAtPath:zip error:nil]; [self tell:@"The saves were not imported" info:err.localizedDescription]; return; }
+    NSDate *when = xcx_saves_export_date(m);
+    NSString *date = when ? [NSDateFormatter localizedStringFromDate:when dateStyle:NSDateFormatterMediumStyle timeStyle:NSDateFormatterShortStyle] : @"?";
+    NSString *info = [NSString stringWithFormat:@"This replaces your current saves. A backup is made first.\n\nFrom: %@\nExported: %@\nGame version: %@",
+                      m[@"device"], date, m[@"game_version_name"] ?: m[@"game_version"]];
+    UIAlertController *ask = [UIAlertController alertControllerWithTitle:@"Import these saves?" message:info preferredStyle:UIAlertControllerStyleAlert];
+    [ask addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
+        (void)a; [NSFileManager.defaultManager removeItemAtPath:zip error:nil]; }]];
+    [ask addAction:[UIAlertAction actionWithTitle:@"Import" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        (void)a;
+        __block NSString *backup = nil;
+        [self busy:^id(NSError **e) {
+            NSString *b = nil;
+            BOOL ok = xcx_saves_import(g_profile, zip, @TOTK_GAME_DIR, &b, nil, e);
+            backup = b;
+            [NSFileManager.defaultManager removeItemAtPath:zip error:nil];
+            return ok ? @YES : nil;
+        } done:^(id result, NSError *e) {
+            if (!result) { [self tell:@"The saves were not imported" info:e.localizedDescription]; return; }
+            fprintf(stderr, "[xcx] start screen: imported saves; backup %s\n", backup ? backup.UTF8String : "(no saves before)");
+            [self tell:@"Saves imported"
+                  info:backup ? [NSString stringWithFormat:@"Your previous saves were copied to Files › On My %@ › %@ › %@.", UIDevice.currentDevice.model, app_name(), backup.lastPathComponent]
+                              : @"There were no previous saves to back up."];
+        }];
+    }]];
+    [self presentViewController:ask animated:YES completion:nil];
+}
+- (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
+- (BOOL)prefersStatusBarHidden { return YES; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
+@end
+
 /* iOS 27 ends apps linked against its SDK that keep the window in the app delegate, so the window belongs to a scene. */
 @interface XCXSceneDelegate : UIResponder <UIWindowSceneDelegate> @property(nonatomic,strong) UIWindow *window; @end
 @implementation XCXSceneDelegate
@@ -83,7 +257,8 @@ void runtime_shortcut_help_toggle(void) {}
     (void)session; (void)options;
     if (![scene isKindOfClass:UIWindowScene.class]) return;
     self.window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
-    self.window.rootViewController = [XCXGameController new]; [self.window makeKeyAndVisible];
+    self.window.rootViewController = g_skip_start_screen ? [XCXGameController new] : [XCXStartController new];
+    [self.window makeKeyAndVisible];
 }
 @end
 
@@ -169,6 +344,13 @@ static void lifecycle_observe(void) {
     // Controller input does not reset the idle timer; auto-lock would suspend the game mid-play.
     application.idleTimerDisabled = YES;
     audio_observe();
+    /* Test launches from the Mac (devicectl --environment-variables) go straight into the game, as before the start
+       screen: XCX_SKIP_START_SCREEN=1, or any of the test-only switches (an input script, autoload, another shader
+       cache folder). Read before this function sets TOTK_SHADER_CACHE itself and clears TOTK_AUTOLOAD. */
+    for (NSString *name in @[@"XCX_SKIP_START_SCREEN", @"TOTK_INPUT_SCRIPT", @"TOTK_AUTOLOAD", @"XC_SHADER_CACHE", @"TOTK_SHADER_CACHE"]) {
+        const char *v = getenv(name.UTF8String);
+        if (v && *v && strcmp(v, "0")) { g_skip_start_screen = YES; g_skip_reason = name; break; }
+    }
     NSString *preferred = NSLocale.preferredLanguages.firstObject;   // as the Mac launcher (app/launcher.m)
     if (preferred.length) setenv("TOTK_LOCALE", preferred.UTF8String, 1);
     NSFileManager *fm = NSFileManager.defaultManager;
@@ -178,6 +360,7 @@ static void lifecycle_observe(void) {
     NSString *log = [docs stringByAppendingPathComponent:@"log.txt"];
     if (freopen(log.fileSystemRepresentation,"w",stderr)) setvbuf(stderr,NULL,_IOLBF,0);
     lifecycle_observe();
+    fprintf(stderr, "[xcx] start screen: %s\n", g_skip_start_screen ? [@"skipped, " stringByAppendingString:g_skip_reason].UTF8String : "shown");
     /* The app carries the RomFS index (GameData/romfs/runtime-index.bin, bound to the build by its SHA-256); the 14.3 GB
        image is installed once into Documents/GameData (romfs.bin, or romfs.bin.000, .001, ... in parts), by
        ios/tools/install_device.py --game-data or by copying it there in Finder / the Files app. Reinstalling the app keeps
@@ -249,7 +432,8 @@ static void lifecycle_observe(void) {
     setenv("DM_NVN_SHMAP",[res stringByAppendingPathComponent:@"shader-seed/shader_map.tsv"].fileSystemRepresentation,1);
     setenv("DM_MSL_DIR",[res stringByAppendingPathComponent:@"shader-seed"].fileSystemRepresentation,1);
     // Same player environment as the Mac launcher (app/launcher.m); the bundle is read-only, so state goes to Documents.
-    setenv("TOTK_PROFILE_DIR",[docs stringByAppendingPathComponent:@"save"].fileSystemRepresentation,1);
+    g_profile = [docs stringByAppendingPathComponent:@"save"];   // also the start screen's (Export / Import Saves)
+    setenv("TOTK_PROFILE_DIR",g_profile.fileSystemRepresentation,1);
     setenv("TOTK_GAME_SLOT_DIR",[docs stringByAppendingPathComponent:@"game-slot"].fileSystemRepresentation,1);
     setenv("TOTK_ROMFS_PROOF_DIR",docs.fileSystemRepresentation,1);   // hash the 14 GB RomFS once, not on every launch
     for (NSString *name in @[@"TOTK_GPU_ALLOW_SUBMIT",@"TOTK_GPU_WIDEN",@"TOTK_GPU_BLOCKRT",@"TOTK_GPU_MIDCLEAR"]) setenv(name.UTF8String,"1",1);

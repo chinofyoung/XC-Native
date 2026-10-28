@@ -1575,3 +1575,81 @@ Mac** (2.0.0, M1 MacBook Air, 2026-10-28, the `XCX_build` app): the item that fl
 treasure container looks right at 60 fps. Other effects (fire, battle arts, the Skell and UI effects) were not checked
 one by one; watch them for anything that now looks wrong. 1.0.1 and the iPhone were not played. The per-particle code of every emitter type was not read; the engine's own half step shows that
 it takes steps other than 1.0.
+
+### 2026-10-28: save export and import (Mac launcher, iPhone / iPad start screen)
+
+Players asked to move a game between a Mac and an iPhone. The saves are plain files, but the folder they sit in is
+named after the device's local account, so copying folders by hand puts them where the game does not look.
+
+**Where the saves are.** `runtime/account.c` keeps the account in `<profile>/account.uid` (16 random bytes, not all
+zero, mode 0600, made at the first start); `runtime/fs_host.c` `init` names the save folder
+`<profile>/save/%016llx%016llx` from its two little-endian words, high word first, and the game writes `sts/game/` in it.
+Checked against this Mac's profile: `account.uid` `08bf1822c8842d71 c4381d0427a58bc8` gives
+`c88ba527041d38c4712d84c82218bf08`, the folder that is there. `<profile>` is `TOTK_PROFILE_DIR` (Mac:
+`~/Library/Application Support/XCNative/XCX/profile`; iOS: `Documents/save`, `ios/Sources/main.m`).
+
+**The core, `app/xcx_saves.{h,m}`.** Foundation, zlib and CommonCrypto only, so the iPhone app can build it as it is (iOS
+has no zip API and cannot start `ditto`). A small zip writer (deflate, or stored when deflate does not help) and reader
+(stored and deflate, through the central directory, so Finder's zips with data descriptors read too; no zip64, no
+encryption; CRC checked; at most 64 entries of 64 MB). The zip holds `xcx-saves.json` first and then the save files
+flat. Import reads and checks everything before writing anything: the manifest is there and of a known format, every
+name is plain (letters, digits, `_ - .`, no `..`, no `/`), each listed file is present once with its size and SHA-256,
+no file is unlisted, and the version order is v101 < v200 (a newer export is refused). Then the whole profile is
+copied to `profile-<version>-backup-<yyyy-MM-dd-HHmmss>` (the builder's Back Up Saves naming), the files are written to
+`<profile>/temp/import-*` (fsynced) and swapped with `sts/game` by `renamex_np(RENAME_SWAP)`, so the folder holds the
+old saves or the new ones, never a mix; the swapped-out old folder is removed (the backup has it, and the runtime empties
+`temp/` at every start anyway). With no `account.uid` yet, import makes one the way the runtime does, so a device that
+never started the game can import.
+
+**The launcher.** A Saves row with Export Saves... (NSSavePanel, default `XCX-saves-<date>.zip`; "There are no saves to
+export yet." when empty) and Import Saves... (NSOpenPanel, then "Import these saves?" / "This replaces your current saves.
+A backup is made first." with the export's device, time and game version, then the result with the backup path, or the
+reason it refused). Both are disabled, with a note, while a process named `xcx-native*` runs, and checked again on
+click. `--export-saves <zip>` / `--import-saves <zip>` do the same without the window; the launcher now honours
+`TOTK_PROFILE_DIR` from the environment for the profile (also for the game it starts). Makefile: the launcher links
+`app/xcx_saves.m`, UniformTypeIdentifiers and zlib.
+
+**Checked:** `tests/test_xcx_saves.py` (new, 15 tests: compiles the core with a driver; round trip into a device with
+another account id and older saves, per-device files untouched, backup contents; no saves; import with no profile; a
+wrong hash; a flipped byte (CRC); 2.0.0 into 1.0.1 refused, 1.0.1 into 2.0.0 accepted, an unknown version; a newer
+format; `../evil`, `/abs`, `sub/x`, `..`, `.hidden`, `a\b`, an empty name; an unlisted file; a listed file missing; no
+manifest; not a zip; a ditto (Finder-style) zip read and refused). Every refusal leaves the profile byte for byte as it
+was and makes no backup. `python3.14 -m unittest discover -s games/xcx/tests`: 174 tests OK. `make launcher` for v101
+and v200 with `-Wall -Wextra -Werror`; the core also compiles for iOS (`xcrun --sdk iphoneos clang -target
+arm64-apple-ios17.0`). Real saves, on a copy of this Mac's profile in a scratch folder (the real profile was not touched):
+the v200 launcher exported 10 entries (9 files, 2.69 MB), Python's zipfile tested the zip, an import into a profile
+without saves made a new account and the files compared identical, a second import made the backup, the v101 launcher
+refused the zip, and a running `xcx-native-v200` process made the launcher refuse. Not checked: the buttons and panels
+were not clicked through (only built), the game was not started on imported saves, and nothing ran on an iPhone yet.
+
+**The iPhone / iPad app: a start screen.** Until now the app started the game as soon as its window scene connected. It
+now opens on a start screen (`XCXStartController` in `ios/Sources/main.m`; black, landscape, the app's name, a large
+**Play** and below it **Export Saves** and **Import Saves**, a note line under them). Play puts the game's view
+controller in its place and the game starts exactly as before (the audio session, the game thread). The game runs in
+the app's own process and cannot be stopped and started again, so Export and Import exist only on this screen, before
+Play. Export writes the zip with `xcx_saves_export` (profile `Documents/save`, `TOTK_GAME_DIR`, the device's name) into
+the temporary folder and opens the share sheet (on iPad pointing at the button); the file is removed when the sheet
+closes. It is off, with "There are no saves to export yet.", when the save folder is empty. Import opens the Files
+picker for a zip (a copy), shows "Import these saves?" with the export's device, time and game version, and on Import
+runs `xcx_saves_import` off the main thread (a spinner, the buttons off) and reports "Saves imported" with the backup's
+place (Files › On My iPhone › the app › `save-<version>-backup-<date>`) or the reason it refused. Without game data
+Play is off and the screen shows the existing "No game data" / "still being copied" message; Export and Import still
+work, so saves can go in before the 14 GB image. A controller's A button (`buttonA`, handler removed again on Play,
+since the runtime reads the pad itself) presses Play when no sheet is open. `ios/project.yml` builds
+`app/xcx_saves.m`, adds `app/` to the header paths and links `libz.tbd`.
+
+**Test launches skip it.** No tool in `ios/tools` launches the app (they install and copy files); test runs launch it
+with `xcrun devicectl device process launch --environment-variables ...`. Such a launch goes straight into the game when
+it sets `XCX_SKIP_START_SCREEN=1`, or any of `TOTK_INPUT_SCRIPT`, `TOTK_AUTOLOAD`, `XC_SHADER_CACHE`, `TOTK_SHADER_CACHE`
+(not empty, not `0`), read before `main.m` sets or clears them itself. `log.txt` says `[xcx] start screen: shown` or
+`skipped, <variable>`, and `start screen: Play` / `exported` / `imported saves; backup ...`.
+
+**Checked (iPhone app):** `ios/tools/build_ipa.py --work XCX_build --version v200` built the IPA (`** BUILD SUCCEEDED
+**`, 33 MiB; the target inhibits warnings, so `main.m` was also checked alone with `xcrun --sdk iphoneos clang -target
+arm64-apple-ios26.0 -fsyntax-only -Wall -Wextra -Werror`, clean); the executable links `/usr/lib/libz.1.dylib` and
+carries the screen's strings. `tests/test_ios_start_screen.py` (new, 8 tests: the project builds the core, finds its
+header and links zlib; the skip switches are read before the app sets them; the scene skips to the game; the buttons
+and the calls). `python3.14 -m unittest discover -s games/xcx/tests`: 182 tests OK. **Play-tested** (2026-10-28,
+2.0.0): saves exported with the Mac launcher (M1 MacBook Air) imported on an iPhone 15 Pro Max through the start screen
+and the Files picker, and the game loaded them. Not checked by hand: an export from the iPhone (share sheet), an import
+on the Mac from the launcher window, the A button, and an iPad.

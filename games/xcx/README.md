@@ -205,6 +205,37 @@ pipeline built (`docs/screenshots/xcx-stage5-app-title.png`, `xcx-stage5-app-con
 The self-contained app was checked the same way, also after being moved out of the work folder (changelog, "one-command
 build").
 
+### Moving saves between Macs and iPhones
+
+The settings window has **Saves: Export Saves... / Import Saves...** (not while the game runs).
+
+- **Export Saves...** writes this Mac's saves into one zip, `XCX-saves-<yyyy-MM-dd-HHmm>.zip`: the files of
+  `profile/save/<id>/sts/game/` (gamedata01, gamedata02, gamedataa, systemdata, avatarmakedata, socialdata and the
+  `.tmb` thumbnails) and `xcx-saves.json` (format, game version, device name, export time, size and SHA-256 per file).
+- **Import Saves...** checks the zip first (the manifest, only plain file names, every hash) and refuses a 2.0.0 export
+  in a 1.0.1 app (1.0.1 saves go into a 2.0.0 app). It then copies the whole profile to
+  `profile-<version>-backup-<date>` next to it, as the builder's Back Up Saves does, and replaces the saves in one step.
+  The account folder `<id>` differs between devices; the saves go into this device's. A refused import changes nothing.
+- `account.uid`, `pseudo-device.id`, `pso_user.tsv`, `cache/` and `temp/` belong to the device and are never exported
+  or replaced. To undo an import, quit the app and put the backup folder back in place of `profile`.
+- Without the window: `"Xenoblade Chronicles X.app/Contents/MacOS/Xenoblade Chronicles X" --export-saves <zip>` or `--import-saves <zip>`
+  (`TOTK_PROFILE_DIR=<folder>` points them at another profile).
+
+On an iPhone or iPad the app opens on a start screen with **Play**, **Export Saves** and **Import Saves** (the game
+runs inside the app and cannot be stopped, so the saves are only exported or replaced there, before Play; to get back
+to it, close the app and open it again).
+
+- **Export Saves** makes the same zip and opens the share sheet: Save to Files, AirDrop to a Mac, and so on. It is off
+  when there are no saves yet.
+- **Import Saves** opens the Files picker. Pick an `XCX-saves-....zip`; the app shows where and when it was exported
+  and the game version, and **Import** backs up `Documents/save` to `save-<version>-backup-<date>` (in the Files app,
+  On My iPhone › the app) and replaces the saves. The same checks as on the Mac apply.
+- Without game data, Play is off and the screen says how to copy `romfs.bin`; saves can still be imported before that.
+- A controller's A button presses Play.
+
+The zip code is `app/xcx_saves.m` (Foundation, zlib and CommonCrypto, no processes), shared by the Mac launcher and the
+iPhone app.
+
 ## What the game uses
 
 - NVN (SDK 19.3.2). Of the 535 NVN names main loads, 430 are implemented in this folder's layer and 7 are intentional
@@ -282,7 +313,12 @@ Skells and cities were not tested; on a fanless Mac or a phone the higher frame 
 
 Everything is generated under `<work>/build/ios*`.
 
-The app (`ios/Sources/main.m`) sets the same runtime switches as `app/launcher.m`. The exported text carries the
+The app (`ios/Sources/main.m`) opens on a start screen (Play, Export Saves, Import Saves; see "Moving saves between Macs
+and iPhones") and sets the same runtime switches as `app/launcher.m`. Test launches from the Mac skip the screen and
+start the game at once: pass `XCX_SKIP_START_SCREEN=1` (`xcrun devicectl device process launch --device <id>
+--environment-variables '{"XCX_SKIP_START_SCREEN": "1"}' <bundle id>`); a launch that sets `TOTK_INPUT_SCRIPT`,
+`TOTK_AUTOLOAD`, `XC_SHADER_CACHE` or `TOTK_SHADER_CACHE` skips it too. `log.txt` says `[xcx] start screen: shown` or
+`skipped, <variable>`. The exported text carries the
 60 fps patch's sites (code cannot change on the device), and the Settings app's Frame rate switch (30 by default) picks
 the values the patch reads, so 30 runs the game's own pacing and frame time. The game image lives in
 Documents/GameData. The runtime reads the index and the image from one folder (`TOTK_ROMFS`), so the app copies its index

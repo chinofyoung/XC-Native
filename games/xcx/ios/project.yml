@@ -26,6 +26,7 @@ targets:
         excludes:
           - Info.plist
           - XCX.entitlements
+      - path: ${XCX_SRC}/app/xcx_saves.m   # save export / import, shared with the Mac launcher (the start screen in main.m)
       - path: ${XCX_SRC}/ios/Settings.bundle   # the Settings app pane (game language picker); applied in main.m
       - path: ${XCX_SRC}/runtime
         excludes:
@@ -45,6 +46,8 @@ targets:
       - path: ${XCX_GEN}/embed.S
       - path: ${XCX_SRC}/runtime/loader.c
         compilerFlags: "-Dmain=totk_host_main"
+    dependencies:
+      - sdk: libz.tbd   # zlib for the saves zip (app/xcx_saves.m)
     info:
       path: ${XCX_GEN}/Info.plist
       properties:
@@ -91,6 +94,7 @@ targets:
       HEADER_SEARCH_PATHS:
         - $(inherited)
         - "\"${XCX_SRC}/runtime\""
+        - "\"${XCX_SRC}/app\""   # xcx_saves.h
         - "\"${XCX_SRC}/third_party/d2r_gfx/gfx/nvn\""
         - "\"${XCX_SRC}/third_party/d2r_gfx/gfx/nvn/include\""
         - "\"${XCX_GEN}\""
