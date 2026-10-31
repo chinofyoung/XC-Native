@@ -8,7 +8,7 @@
 #include "runtime.h"
 #include "game_version.h"
 #include "totk_ui_lang.h"
-#include "../third_party/d2r_gfx/gfx/nvn/totk_mfx_mode.h"
+#include "toggle_keys.h"
 static NSWindow *window;
 uint64_t dm_nvn_frame_count(void);   /* gfx/nvn/hle_nvn.c: game frames presented so far */
 static CAMetalLayer *metalLayer;
@@ -99,7 +99,8 @@ static CVReturn vsync_callback(CVDisplayLinkRef link,const CVTimeStamp *now,cons
 @end
 @implementation TOTKInputView
 -(BOOL)acceptsFirstResponder{return YES;}
--(void)keyDown:(NSEvent *)e{runtime_input_key(e.keyCode,1);}
+/* A held toggle key (1 to 5) repeats nothing: keys[] in input.c drops repeats too, but a docked / handheld switch clears it. */
+-(void)keyDown:(NSEvent *)e{if(e.ARepeat&&e.keyCode>=18&&e.keyCode<=23)return;runtime_input_key(e.keyCode,1);}
 -(void)keyUp:(NSEvent *)e{runtime_input_key(e.keyCode,0);}
 -(void)flagsChanged:(NSEvent *)e{if(e.keyCode==56)runtime_input_key(56,!!(e.modifierFlags&NSEventModifierFlagShift));if(e.keyCode==58)runtime_input_key(58,!!(e.modifierFlags&NSEventModifierFlagOption));}
 @end
@@ -110,35 +111,45 @@ static CVReturn vsync_callback(CVDisplayLinkRef link,const CVTimeStamp *now,cons
 -(void)position;
 -(void)refresh;
 @end
-/* Compact HUD (default): one small box in the window's top-right corner with the FPS, shader and load lines (published by
-   gfx/nvn/fps_overlay.c, refreshed twice a second) above the shortcuts. TOTK_HUD=corners: the lines stay in the picture's
-   corners and this is the larger centred shortcut box. */
+/* Compact HUD (default): one small box in the window's top-right corner. Its content follows key 1's level
+   (runtime/toggle_keys.c): full = the FPS, shader and load lines (published by gfx/nvn/fps_overlay.c, refreshed twice a
+   second), the toggles' states and the key list; smaller = the FPS line and the states; FPS only; hidden. A key 2 to 4
+   press shows its confirmation on top for about 2 s at every level, hidden included. TOTK_HUD=corners: the lines stay in
+   the picture's corners and this is a larger centred box with the key list (full level) or the confirmation. */
 @implementation TOTKShortcutHelp
-static NSString *shortcut_text(void){
- const char *interp;
- switch(mfx_enabled()){
-  case MFX_30:interp="30+30";break;
-  case MFX_HALF:interp=TOTK_UI("刷新率一半","half refresh rate");break;
-  case MFX_MAX:interp=TOTK_UI("不限帧","unlimited");break;
-  default:interp=TOTK_UI("关闭","off");break;
- }
- return [NSString stringWithFormat:@(TOTK_UI("快捷键说明\n1  显示 / 隐藏所有提示\n2  补帧：当前 %@（按键切换）","Shortcuts\n1  Show / hide all overlays\n2  Interpolation: %@ (current; press to cycle)")),[NSString stringWithUTF8String:interp]];
+static NSString *toggle_states(void){
+ int fr=toggle_frame_rate();
+ NSString *fps=[NSString stringWithFormat:@(TOTK_UI("%d 帧%s","%d fps%s")),fr,toggle_frame_rate_pending()?TOTK_UI("（下次启动）"," (next start)"):""];
+ return [NSString stringWithFormat:@"%s · %@ · %s%s",toggle_scaling()?TOTK_UI("缩放 MetalFX","Scaling MetalFX"):TOTK_UI("缩放 无","Scaling none"),fps,
+  toggle_handheld()?TOTK_UI("掌机模式","Handheld"):TOTK_UI("主机模式","Docked"),toggle_handheld_pending()?TOTK_UI("（下次启动）"," (next start)"):""];
+}
+static NSString *key_list(void){
+ return @(TOTK_UI("1  提示：完整 / 精简 / 仅帧数 / 隐藏\n2  缩放：MetalFX / 无\n3  帧率：30 / 60\n4  渲染：主机 / 掌机",
+                  "1  Overlay: full / smaller / FPS only / hidden\n2  Scaling: MetalFX / none\n3  Frame rate: 30 / 60\n4  Rendering: docked / handheld"));
 }
 -(instancetype)initWithFrame:(NSRect)frame{if((self=[super initWithFrame:frame])){int compact=hud_compact();self.wantsLayer=YES;self.layer.backgroundColor=[NSColor colorWithCalibratedWhite:0.04 alpha:compact?0.72:0.86].CGColor;self.layer.cornerRadius=compact?7:14;self.layer.borderWidth=1;self.layer.borderColor=[NSColor colorWithCalibratedWhite:1 alpha:compact?0.14:0.2].CGColor;
- self.label=[NSTextField labelWithString:shortcut_text()];self.label.font=[NSFont systemFontOfSize:17 weight:NSFontWeightMedium];self.label.textColor=NSColor.whiteColor;self.label.alignment=NSTextAlignmentCenter;self.label.maximumNumberOfLines=0;self.label.lineBreakMode=NSLineBreakByWordWrapping;self.label.frame=NSInsetRect(self.bounds,20,18);self.label.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;[self addSubview:self.label];
+ self.label=[NSTextField labelWithString:@""];self.label.font=[NSFont systemFontOfSize:17 weight:NSFontWeightMedium];self.label.textColor=NSColor.whiteColor;self.label.alignment=NSTextAlignmentCenter;self.label.maximumNumberOfLines=0;self.label.lineBreakMode=NSLineBreakByWordWrapping;self.label.frame=NSInsetRect(self.bounds,20,18);self.label.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;[self addSubview:self.label];
  if(compact){self.label.alignment=NSTextAlignmentLeft;self.label.lineBreakMode=NSLineBreakByClipping;}
  [self refresh];__weak TOTKShortcutHelp *weak=self;self.timer=[NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t){(void)t;[weak refresh];}];}return self;}
 -(void)refresh{
- if(!hud_compact()){self.label.stringValue=shortcut_text();return;}
- NSFont *mono=[NSFont monospacedSystemFontOfSize:10.5 weight:NSFontWeightMedium],*small=[NSFont systemFontOfSize:10];
- NSColor *green=[NSColor colorWithCalibratedRed:80/255.0 green:1 blue:120/255.0 alpha:1],*yellow=[NSColor colorWithCalibratedRed:1 green:230/255.0 blue:40/255.0 alpha:1];
+ int level=toggle_overlay_level();const char *confirm=toggle_confirmation(runtime_now_ns());
+ if(!hud_compact()){
+  NSString *t=level==0?[NSString stringWithFormat:@"%@\n%@",key_list(),toggle_states()]:@"";
+  if(confirm)t=t.length?[NSString stringWithFormat:@"%s\n%@",confirm,t]:@(confirm);
+  self.hidden=!t.length;if(t.length)self.label.stringValue=t;return;}
+ NSFont *mono=[NSFont monospacedSystemFontOfSize:10.5 weight:NSFontWeightMedium],*small=[NSFont systemFontOfSize:10],*bold=[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
+ NSColor *green=[NSColor colorWithCalibratedRed:80/255.0 green:1 blue:120/255.0 alpha:1],*yellow=[NSColor colorWithCalibratedRed:1 green:230/255.0 blue:40/255.0 alpha:1],*grey=[NSColor colorWithCalibratedWhite:0.75 alpha:1];
+ NSMutableArray<NSAttributedString *> *parts=[NSMutableArray new];
+ if(confirm)[parts addObject:[[NSAttributedString alloc] initWithString:@(confirm) attributes:@{NSFontAttributeName:bold,NSForegroundColorAttributeName:yellow}]];
+ for(int i=0;level<3&&i<(level==0?3:1);i++){char t[128];int hl=0;if(!hud_snapshot(i,t,sizeof t,&hl))continue;
+  [parts addObject:[[NSAttributedString alloc] initWithString:[NSString stringWithUTF8String:t] ?: @"" attributes:@{NSFontAttributeName:mono,NSForegroundColorAttributeName:hl?yellow:green}]];}
+ NSMutableParagraphStyle *gap=[NSMutableParagraphStyle new];gap.paragraphSpacingBefore=parts.count?4:0;
+ if(level<=1)[parts addObject:[[NSAttributedString alloc] initWithString:toggle_states() attributes:@{NSFontAttributeName:small,NSForegroundColorAttributeName:grey,NSParagraphStyleAttributeName:gap}]];
+ if(level==0)[parts addObject:[[NSAttributedString alloc] initWithString:key_list() attributes:@{NSFontAttributeName:small,NSForegroundColorAttributeName:grey,NSParagraphStyleAttributeName:gap}]];
  NSMutableAttributedString *a=[NSMutableAttributedString new];
- for(int i=0;i<3;i++){char t[128];int hl=0;if(!hud_snapshot(i,t,sizeof t,&hl))continue;
-  [a appendAttributedString:[[NSAttributedString alloc] initWithString:[([NSString stringWithUTF8String:t] ?: @"") stringByAppendingString:@"\n"] attributes:@{NSFontAttributeName:mono,NSForegroundColorAttributeName:hl?yellow:green}]];}
- if(a.length){NSMutableParagraphStyle *gap=[NSMutableParagraphStyle new];gap.paragraphSpacingBefore=4;
-  [a appendAttributedString:[[NSAttributedString alloc] initWithString:shortcut_text() attributes:@{NSFontAttributeName:small,NSForegroundColorAttributeName:[NSColor colorWithCalibratedWhite:0.75 alpha:1],NSParagraphStyleAttributeName:gap}]];}
- else [a appendAttributedString:[[NSAttributedString alloc] initWithString:shortcut_text() attributes:@{NSFontAttributeName:small,NSForegroundColorAttributeName:[NSColor colorWithCalibratedWhite:0.75 alpha:1]}]];
- if([a isEqualToAttributedString:self.label.attributedStringValue])return;
+ for(NSUInteger i=0;i<parts.count;i++){if(i)[a appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n" attributes:@{NSFontAttributeName:small}]];[a appendAttributedString:parts[i]];}
+ self.hidden=!a.length;
+ if(!a.length||[a isEqualToAttributedString:self.label.attributedStringValue])return;
  self.label.attributedStringValue=a;NSSize z=[self.label sizeThatFits:NSMakeSize(CGFLOAT_MAX,CGFLOAT_MAX)];self.textSize=NSMakeSize(ceil(z.width),ceil(z.height));[self position];}
 -(NSView *)hitTest:(NSPoint)p{(void)p;return nil;}
 -(void)viewDidMoveToSuperview{[super viewDidMoveToSuperview];[self position];}
@@ -148,7 +159,12 @@ static NSString *shortcut_text(void){
  else{CGFloat w=MIN(560,MAX(280,self.superview.bounds.size.width-40)),h=168;f=NSMakeRect(floor((self.superview.bounds.size.width-w)/2),floor((self.superview.bounds.size.height-h)/2),w,h);in=NSInsetRect(NSMakeRect(0,0,w,h),20,18);}
  if(!NSEqualRects(self.frame,f))self.frame=f;self.label.frame=in;}
 @end
-void runtime_shortcut_help_toggle(void){int show=fps_overlay_toggle_hints();dispatch_async(dispatch_get_main_queue(), ^{shortcutHelp.hidden=!show;});}
+/* A key changed something (runtime/toggle_keys.c): show it now, not at the next half-second tick, and take the
+   confirmation away when its 2 s are over. */
+void runtime_hud_poke(void){
+ dispatch_async(dispatch_get_main_queue(), ^{[(TOTKShortcutHelp *)shortcutHelp refresh];});
+ dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(2.05*NSEC_PER_SEC)),dispatch_get_main_queue(),^{[(TOTKShortcutHelp *)shortcutHelp refresh];});
+}
 /* The drawable follows the window's pixel size; the present pass scales the game picture (1920x1080 docked) into it and
    keeps 16:9 (black bars on other shapes), so a larger window or full screen shows the game at its own resolution instead
    of a fixed small drawable that the compositor stretches. */
@@ -234,9 +250,10 @@ void runtime_front_run(void(*callback)(void)){
   bootProgress.minValue=0;bootProgress.maxValue=100;bootProgress.indeterminate=YES;bootProgress.autoresizingMask=NSViewMinXMargin|NSViewMaxXMargin|NSViewMinYMargin|NSViewMaxYMargin;
   [bootOverlay addSubview:bootStage];[bootOverlay addSubview:bootDetail];[bootOverlay addSubview:bootProgress];
   [window.contentView addSubview:bootOverlay];[bootProgress startAnimation:nil];
+  toggle_keys_init();   /* the keys' start values (overlay level, scaling, frame rate, mode), before the HUD shows them */
   shortcutHelp=[[TOTKShortcutHelp alloc] initWithFrame:NSZeroRect];shortcutHelp.autoresizingMask=hud_compact()?NSViewMinXMargin|NSViewMinYMargin:NSViewMinXMargin|NSViewMaxXMargin|NSViewMinYMargin|NSViewMaxYMargin;
   /* Keep discovery/warm-up visible; the help appears after the opaque boot
-     overlay is hidden. Key 1 still controls its requested visibility. */
+     overlay is hidden. Key 1's level decides what it shows (refresh). */
   [window.contentView addSubview:shortcutHelp positioned:NSWindowBelow relativeTo:bootOverlay];
   [(TOTKShortcutHelp *)shortcutHelp position];
   /* The FPS, shader and load lines: in the corner panel above (compact HUD), or with TOTK_HUD=corners drawn into the game picture's corners by the present encoder (gfx/nvn/fps_overlay.c). */

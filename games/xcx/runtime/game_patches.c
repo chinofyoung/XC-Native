@@ -75,7 +75,8 @@ static void apply_file(Module *m, const char *slug) {
      player as its target). Site 5 is the add just before the store (main+0x289730), site 6 the fmov #1.0; each branches
      to a veneer that runs the original word and, in mode 1, multiplies s0 by frame time x 30. The engine's own half
      step (main+0x289748, a flag the port never sets) still applies after site 5.
-   XCX_FPS60=0 with the patch keeps N = 2 and the original GetFrameTime (A/B in one build; iOS's "off"). On iOS code pages
+   XCX_FPS60=0 with the patch keeps N = 2 and the original GetFrameTime (A/B in one build; iOS's "off"; the Mac app applies
+   the patch at every start in the mode of its frame rate, so key 3 can switch live: runtime_fps60_set). On iOS code pages
    cannot be written at run time: ios/tools/build_ipa.py exports main's text with these sites patched (TOTK_EXPORT_IOS)
    and the device only checks that the patched words are there; the Settings switch picks the page's values. */
 #if defined(XCX_GAME_V200)
@@ -133,7 +134,7 @@ static const uint32_t fps60_qte_veneer[9] = {
 #endif
 typedef struct { _Atomic uint32_t frame_bits; _Atomic int32_t vsync; _Atomic int32_t realtime; } Fps60Page;
 static Fps60Page *fps60_page;
-static int fps60_on;
+static _Atomic int fps60_on;   /* the mode; key 3 changes it while the game runs (runtime_fps60_set) */
 
 static uint32_t enc_adrp(unsigned rd, uint64_t site, uint64_t target) {   /* offsets in main; main's base is page aligned */
     int64_t pages = (int64_t)(target >> 12) - (int64_t)(site >> 12);
@@ -253,6 +254,37 @@ void runtime_frame_step_pin(double ms) {
     atomic_store(&pinned_step_us, us);
     if (fps60_page && fps60_on && us) frame_step_store((float)(us / 1e6));
     fprintf(stderr, "[xcx] frame step %s%s\n", us ? "pinned (diagnostics)" : "measured again", fps60_page && fps60_on ? "" : " -- but the 60 fps patch is off, nothing changes");
+}
+/* Key 3 (runtime/toggle_keys.c): 30 / 60 while the game runs (2026-10-31, measured on 2.0.0: 3 round trips in the field,
+   each at once, 30.1 fps and the M1's ~46, walking speed 8.5-8.7 m/s at both; findings in
+   docs/superpowers/plans/2026-10-31-in-game-toggle-keys-findings.md). SetVsyncCount stores N in an int of main's data
+   (through the GOT); the limiter, GetFrameTime, the per-frame sync and GetVsyncCount's callers all read it fresh on every
+   call and none keeps a step worked out from it at start-up, so writing N with the page's mode is the whole switch and is
+   safe at any moment (at worst one frame mixes the two steps). Going to 60 the step starts at 1/30 s, the frames' length
+   until then, and the measured mean takes over within 4 frames (runtime_frame_step_update restarts its samples: the gap
+   since its last present is longer than 0.25 s). 1.0.1: N is at main+0x1da33a0 (read from the 1.0.1 image: GetVsyncCount
+   main+0x13b22e4 loads it, SetVsyncCount main+0x13b2d18's GOT entry main+0x1d7dbf0 names it; main's data moved 0xf000,
+   not the text's 0xfd40), not measured in play. N must read 1 or 2 before it is written (a wrong address is refused).
+   Returns 0 when the switch is not possible in this run (no 60 fps patch; iOS, where nothing calls it). */
+#if defined(XCX_GAME_V200)
+#define FPS60_VSYNC_COUNT 0x1d943a0ULL   /* int32 N (the previous N at +4) */
+#else
+#define FPS60_VSYNC_COUNT 0x1da33a0ULL
+#endif
+int runtime_fps60_get(void) { return fps60_page && atomic_load(&fps60_on); }
+int runtime_fps60_set(int on) {
+    if (!fps60_page || CODE_PATCHED_AT_BUILD) { fprintf(stderr, "[keys] frame rate: the 60 fps patch is not applied in this run (XCX_PATCHES=60fps), next start only\n"); return 0; }
+    _Atomic int32_t *n = (_Atomic int32_t *)(void *)(runtime_module_base("main") + FPS60_VSYNC_COUNT);
+    int32_t was = atomic_load(n);
+    if (was != 1 && was != 2) { fprintf(stderr, "[keys] frame rate: the game's vsync count at main+%#llx reads %d, not 1 or 2; not switched\n", (unsigned long long)FPS60_VSYNC_COUNT, was); return 0; }
+    on = !!on;
+    if (on) { uint32_t us = atomic_load(&pinned_step_us); frame_step_store(us ? (float)(us / 1e6) : 1.0f / 30.0f); }
+    atomic_store(&fps60_on, on);
+    atomic_store(&fps60_page->vsync, on ? 1 : 2);
+    atomic_store(&fps60_page->realtime, on ? 1 : 0);
+    atomic_store(n, on ? 1 : 2);
+    fprintf(stderr, "[keys] frame rate %d: the game's vsync count %d -> %d, frame time %s\n", on ? 60 : 30, was, on ? 1 : 2, on ? "measured" : "the game's own");
+    return 1;
 }
 void runtime_frame_step_update(uint64_t now_ns) {
     static uint64_t last; static double samples[4], sum_all; static unsigned count, next, frames, clamped;

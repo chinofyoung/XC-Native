@@ -95,8 +95,7 @@ void runtime_warm_done(void);
 void runtime_game_slot_acquire(const char *mode);   /* runtime/game_slot.c: one game at a time */
 void *runtime_front_override(const char *name);
 int runtime_front_focus(void);
-void runtime_shortcut_help_toggle(void);
-int fps_overlay_toggle_hints(void);   /* shared key 1 toggle for FPS, shader and system-load overlays */
+int fps_overlay_toggle_hints(void);   /* toggles the FPS, shader and system-load overlays together (the Mac's key 1: runtime/toggle_keys.c) */
 float runtime_aspect_now(void);     /* the ultrawide ratio in force (TotK's aspect patch, not part of this port): always 0, the game's own 16:9 */
 int hud_compact(void);   /* gfx/nvn/fps_overlay.c: the overlay lines go to the window's corner panel (TOTK_HUD=corners: in the picture) */
 int hud_snapshot(int line, char *out, size_t n, int *highlight);   /* line 0..2: FPS, shaders, load; 0 = not published */
@@ -110,7 +109,10 @@ void runtime_memory_probe(void);
 
 void runtime_input_key(unsigned code,int down);
 void runtime_input_clear(void);
-int runtime_handheld_mode(void);   /* TOTK_OPERATION_MODE=handheld (runtime/services.c) */
+int runtime_handheld_mode(void);   /* TOTK_OPERATION_MODE=handheld at start, then key 4 (runtime/services.c) */
+int runtime_handheld_set(int on);   /* runtime/services.c: switch docked / handheld while the game runs (key 4); 0: not yet possible */
+int runtime_oe_push_message_once(uint32_t message);   /* runtime/applet_host.c: 1 queued, 0 already queued, -1 queue full */
+void runtime_input_mode_changed(void);   /* runtime/input.c: the pad follows a mode switch */
 void *runtime_input_override(const char *name);
 void *runtime_xcx_override(const char *name);   /* runtime/system_services.c: network and system functions TotK never used */
 typedef struct { uint64_t buttons; int32_t lx,ly,rx,ry; int connected; } RuntimeGamepadState;

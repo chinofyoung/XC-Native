@@ -17,9 +17,11 @@
    What each setting does in the runtime:
    - Frame rate: 30 (the game's own; the default) or 60 (experimental): the port's 60 fps patch (XCX_PATCHES=60fps,
      runtime/game_patches.c: the game's vsync count 2 -> 1 and its frame time measured; not part of the presets, saved as
-     "frame_rate"; XCX_FRAME_RATE=30|60 from the environment wins for one start, for scripted checks). Either way on a 60 Hz
-     present base (DM_PRESENT_HZ=60) with the game's present interval 1. The internal resolution is the game's own
-     (dynamic, up to 1600x900).
+     "frame_rate"; XCX_FRAME_RATE=30|60 from the environment wins for one start, for scripted checks). The patch is applied
+     at every start, with XCX_FPS60=0 at 30 (the game's own vsync count and frame time, measured the same as without the
+     patch, 2026-10-31), so key 3 can switch 30 / 60 while the game runs. Either way on a 60 Hz present base
+     (DM_PRESENT_HZ=60) with the game's present interval 1. The internal resolution is the game's own (dynamic, up to
+     1600x900).
    - Rendering: docked (the default) or handheld (TOTK_OPERATION_MODE=docked|handheld: the game uses its own Switch handheld
      settings, a 1280x720 output and a lower internal resolution, so the GPU renders less; input is the same; not part of the
      presets, saved as "handheld"; TOTK_OPERATION_MODE from the environment wins for one start, for scripted checks).
@@ -27,9 +29,13 @@
      output resolution (TOTK_DRAWABLE_SCALE relative to the monitor's pixels) and the scaler (MetalFX spatial upscaling of
      the game's picture to the output, TOTK_MFX_UPSCALE / TOTK_MFX_OUTPUT, or plain linear scaling).
    - The RomFS interface mod; the FPS / resolution HUD.
+   In-game keys 2 to 4 (runtime/toggle_keys.c: scaling, frame rate, rendering) save "metalfx" (and preset = Custom),
+   "frame_rate" and "handheld" here for the next start: the launcher sets XCX_REMEMBER_KEYS=1 and XCX_SETTINGS_DOMAIN
+   (this bundle's identifier; the game runs in this process after execv, without a bundle of its own). Terminal runs
+   set neither, so they never change the player's settings.
    Player exefs patches (scripts/prepare_patches.py -> <game folder>/patches/<slug>.tsv) have no setting: XCX_PATCHES
    from the environment (open --env XCX_PATCHES=<slug>,<slug> <app>) reaches the runtime (runtime/game_patches.c), with
-   60fps added when the frame rate is 60; unset and at 30 fps, none is applied.
+   60fps always added (see Frame rate).
    Progress: the player's profile (account, saves, pseudo device id, pipeline list) is in Application Support
    (XCNative/XCX/profile). On the first start without one it is seeded by COPYING <work>/user-data (the profile the
    terminal runs use), so Continue loads the same save; the originals are never moved or changed (development apps
@@ -49,6 +55,7 @@
 #include "game_version.h"    /* TOTK_GAME_VERSION, TOTK_GAME_DIR (runtime/) */
 #include "totk_shader_contrib.h"   /* the shared shader list contribution and its reminder (third_party/d2r_gfx/gfx/nvn) */
 #include "xcx_saves.h"       /* save export / import (app/) */
+#include "toggle_keys.h"     /* XCX_PRESET_CUSTOM: the preset index the game's key 2 saves (runtime/) */
 #include <errno.h>
 #include <libproc.h>
 #include <stdio.h>
@@ -66,6 +73,7 @@ static const Preset presets[] = {   // XCX: no MetalFX (spatial upscaling not ye
     {"Original (30 fps, pantalla completa)", "Original (30 fps, full screen)", 1, 0, 0, 2},
 };
 enum { NPRESETS = sizeof presets / sizeof *presets };
+_Static_assert(NPRESETS == XCX_PRESET_CUSTOM, "runtime/toggle_keys.h XCX_PRESET_CUSTOM must be the Custom entry's index (NPRESETS)");
 static const int sizes[][2] = {{1280, 720}, {1600, 900}, {1920, 1080}, {2560, 1440}};
 static const int outputs[] = {0, 2160, 1440, 1080, 900};
 
@@ -500,15 +508,20 @@ int main(int argc, char **argv) {
         }
         if (chdir(work.fileSystemRepresentation)) { fail(work); return 1; }   // the runtime reads extracted/ and rewritten/ relative to it
 
-        /* Frame rate 60: the port's 60 fps patch, added to the player's own XCX_PATCHES (see the comment at the top). */
+        /* The port's 60 fps patch at every start, added to the player's own XCX_PATCHES, in the mode of the frame rate
+           (XCX_FPS60=0 at 30), so key 3 can switch while the game runs (see the comment at the top). */
         const char *fr = getenv("XCX_FRAME_RATE");
         BOOL fps60 = fr && *fr ? atoi(fr) == 60 : [d integerForKey:@"frame_rate"] == 60;
-        if (fps60) {
+        {
             const char *had = getenv("XCX_PATCHES");
             NSString *list = had && *had ? @(had) : @"";
             if (![[list componentsSeparatedByString:@","] containsObject:@"60fps"]) list = list.length ? [list stringByAppendingString:@",60fps"] : @"60fps";
             setenv("XCX_PATCHES", list.UTF8String, 1);
+            setenv("XCX_FPS60", fps60 ? "1" : "0", 1);
         }
+        /* The in-game keys 2 to 4 save their changes for the next start (runtime/toggle_keys.c); only app runs. */
+        setenv("XCX_REMEMBER_KEYS", "1", 1);
+        setenv("XCX_SETTINGS_DOMAIN", (NSBundle.mainBundle.bundleIdentifier ?: @"org.xcnative.xcx").UTF8String, 1);
         const char *om = getenv("TOTK_OPERATION_MODE");   // handheld: the game's own handheld settings (see the comment at the top)
         if (!(om && *om)) setenv("TOTK_OPERATION_MODE", [d boolForKey:@"handheld"] ? "handheld" : "docked", 1);
         setenv("DM_PRESENT_HZ", "60", 1);   // the present base at both frame rates: the game presents with interval 1, its own cap paces it
@@ -528,7 +541,7 @@ int main(int argc, char **argv) {
         if ([d boolForKey:@"metalfx"]) { setenv("TOTK_MFX_UPSCALE", "1", 1); setenv("TOTK_MFX_OUTPUT", "1", 1); }
         if ([d objectForKey:@"hud"] && ![d boolForKey:@"hud"]) setenv("TOTK_FPS_OVERLAY", "0", 1); else setenv("XCX_HUD_RENDER", "1", 1);
         unsetenv("TOTK_HUD");   // the compact HUD (corner panel), never TOTK_HUD=corners
-        unsetenv("TOTK_MFX");   // MetalFX frame interpolation off at start (stage 4: a net loss on an M1); key 2 still toggles it
+        unsetenv("TOTK_MFX");   // MetalFX frame interpolation off (stage 4: a net loss on an M1; ghosting); no key toggles it for now
         NSString *mod = [d stringForKey:@"mod"];
         if (mod && [romfs_mods() containsObject:mod]) setenv("TOTK_ROMFS_MODS", [mods_folder() stringByAppendingFormat:@"/%@/romfs", mod].fileSystemRepresentation, 1);
         else setenv("TOTK_ROMFS_MODS", "0", 1);

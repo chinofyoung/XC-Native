@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <TargetConditionals.h>
+#include "toggle_keys.h"
 typedef struct{int64_t sampling;uint64_t buttons;int32_t lx,ly,rx,ry;uint32_t attributes,pad;} NpadState;
 _Static_assert(sizeof(NpadState)==40,"Npad full-key ABI");
 static pthread_mutex_t inputLock=PTHREAD_MUTEX_INITIALIZER;
@@ -26,13 +28,16 @@ static void user_input(const char *what){
  fprintf(stderr,"[input] user input (%s)%s%s\n",what,agent?": the user is playing this test session of ":"",agent?owner:"");
 }
 /* Keys from the window are the user's; scripted and auto-load presses use the synthetic entry.
-   Key 1 toggles the shortcut reminder in frontend.m. Key 2 (Mac key code 19) cycles MetalFX frame interpolation:
-   off -> 30+30 -> half the refresh rate -> uncapped (totk_mfx.m). Held-key repeats do not cycle. Keys 3 and 4 (TotK's
-   2K picture modes and ultrawide toggle) are not bound: this runtime has neither (their hooks were stubs). */
-enum { KEY_INTERP_TOGGLE = 19 };
+   Keys 1 to 5 of the number row (Mac key codes 18 to 21 and 23) are the in-game toggles, runtime/toggle_keys.c: the
+   overlay, the scaling, the frame rate, docked / handheld, and nothing on 5 (frame interpolation, hidden until it is
+   fixed). Only a fresh press switches: a held key's repeats do not (keys[] here; the window also drops repeats, as
+   a mode switch clears keys[]). They map no controller button. iOS has no keyboard in normal play and no toggles. */
 void runtime_input_key_synthetic(unsigned code,int down){if(code>=128)return;pthread_mutex_lock(&inputLock);int press=down&&!keys[code];if(down&&!keys[code])pending|=button(code);keys[code]=(unsigned char)!!down;pthread_mutex_unlock(&inputLock);
- if(press&&code==18){extern void runtime_shortcut_help_toggle(void);runtime_shortcut_help_toggle();}
- if(press&&code==KEY_INTERP_TOGGLE){extern void dm_gfx_set_flag(const char *name,int v);dm_gfx_set_flag("mfx_interp",-1);}
+#if !TARGET_OS_IPHONE
+ if(press&&code>=18&&code<=23&&code!=22)toggle_keys_press(code);
+#else
+ (void)press;
+#endif
 }
 void runtime_input_key(unsigned code,int down){if(down&&code<128)user_input("keyboard");runtime_input_key_synthetic(code,down);}
 void runtime_input_clear(void){pthread_mutex_lock(&inputLock);memset(keys,0,sizeof(keys));pending=0;pthread_mutex_unlock(&inputLock);runtime_gamepad_clear();}
@@ -46,8 +51,18 @@ static void input_log(const char *what,uint32_t id){static int on=-1;static uint
  fprintf(stderr,"[totk-input] game reads %s for controller %#x (supported styles %#x, ids allowed %d)\n",what,id,styles,allowed);}
 static uint32_t pad_id(void){return runtime_handheld_mode()?0x20u:0u;}
 static uint32_t pad_style(void){return runtime_handheld_mode()?2u:1u;}
+/* The game's id list is kept so a live docked / handheld switch (key 4, runtime_handheld_set) can work out again whether
+   the game reads the pad now in use (XCX supports 0, 1, 2 and 0x20, so both are allowed). */
+static uint32_t supportedIds[10];static uint64_t supportedN;static bool idsSet;
 static void supported_ids(const uint32_t *ids,uint64_t n){if(n>10||(!ids&&n))runtime_fail("invalid controller ids");
- if(getenv("TOTK_INPUT_LOG")){char b[128];size_t o=0;for(uint64_t i=0;i<n&&o<100;i++)o+=(size_t)snprintf(b+o,sizeof b-o," %#x",ids[i]);b[o]=0;fprintf(stderr,"[totk-input] game supports controller ids:%s\n",b);}pthread_mutex_lock(&inputLock);allowed=false;for(uint64_t i=0;i<n;i++)if(ids[i]==pad_id())allowed=true;pthread_mutex_unlock(&inputLock);}
+ if(getenv("TOTK_INPUT_LOG")){char b[128];size_t o=0;for(uint64_t i=0;i<n&&o<100;i++)o+=(size_t)snprintf(b+o,sizeof b-o," %#x",ids[i]);b[o]=0;fprintf(stderr,"[totk-input] game supports controller ids:%s\n",b);}
+ pthread_mutex_lock(&inputLock);supportedN=n;idsSet=true;allowed=false;for(uint64_t i=0;i<n;i++){supportedIds[i]=ids[i];if(ids[i]==pad_id())allowed=true;}pthread_mutex_unlock(&inputLock);}
+/* After the mode changed (runtime/services.c): the pad is now the other controller (id 0 full-key docked, 0x20
+   handheld). Held keys are dropped so nothing stays pressed on the controller the game no longer reads. */
+void runtime_input_mode_changed(void){runtime_input_clear();pthread_mutex_lock(&inputLock);bool was=allowed;
+ if(idsSet){allowed=false;for(uint64_t i=0;i<supportedN;i++)if(supportedIds[i]==pad_id())allowed=true;}
+ bool now=allowed;uint32_t s=styles;pthread_mutex_unlock(&inputLock);
+ fprintf(stderr,"[keys] controller now id %#x style %u, read by the game %d -> %d (styles %#x)\n",pad_id(),pad_style(),was,now,s);}
 static void supported_styles(uint32_t value){pthread_mutex_lock(&inputLock);styles=value;pthread_mutex_unlock(&inputLock);}
 static uint32_t style(const uint32_t *id){if(!id)runtime_fail("controller id pointer");input_log("style set",*id);pthread_mutex_lock(&inputLock);uint32_t v=enabled&&allowed&&*id==pad_id()?(styles&pad_style()):0;pthread_mutex_unlock(&inputLock);return v;}
 static int pad_states(NpadState *out,int max,const uint32_t *id,uint32_t want_style);

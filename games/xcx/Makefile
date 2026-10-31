@@ -110,9 +110,9 @@ launcher: $(LAUNCHER)
 icon: $(OUT)/AppIcon.icns
 # dmsh_chain.h: the shader cache's name, which a self-contained app keeps in the user's Library; totk_shader_contrib.h:
 # the share reminder and the contribution file; game_version.h: the version the launcher's --check compares with
-# Info.plist; xcx_saves.m: Export / Import Saves (zlib for the zip)
+# Info.plist; xcx_saves.m: Export / Import Saves (zlib for the zip); toggle_keys.h: the preset index the game's key 2 saves
 $(LAUNCHER): app/launcher.m app/xcx_saves.m app/xcx_saves.h third_party/d2r_gfx/gfx/nvn/dmsh_chain.h third_party/d2r_gfx/gfx/nvn/totk_shader_contrib.h \
-             runtime/game_version.h Makefile
+             runtime/game_version.h runtime/toggle_keys.h Makefile
 	@mkdir -p "$(dir $@)"
 	xcrun clang -std=gnu11 -O2 -Wall -Wextra -Werror -fobjc-arc $(VERSION_FLAGS) -Ithird_party/d2r_gfx/gfx/nvn -Iruntime app/launcher.m app/xcx_saves.m -framework Cocoa -framework UniformTypeIdentifiers -lz -o "$@"
 $(OUT)/AppIcon.icns:

@@ -367,10 +367,17 @@ The Mac keyboard uses physical key positions of a US layout:
 
 Extra keys:
 
-- **1** shows or hides the on-screen overlay.
-- **2** cycles MetalFX frame interpolation: off, 30+30, half the refresh rate, unlimited. It works, but on an M1 it costs
-  more than it gains: with 30+30 the game itself drops to about 23-27 fps. It is off at start.
-- Keys **3** and **4** do nothing: Tears of the Kingdom's picture-mode and ultrawide keys are not part of this port.
+- **1** cycles the overlay: full (FPS, shader and load lines, the current settings and this key list), smaller (FPS
+  line and settings), FPS only, hidden. It starts full, or hidden when the launcher's HUD setting is off.
+- **2** switches scaling: MetalFX (both MetalFX steps, as the launcher's scaler) or none.
+- **3** switches the frame rate between 30 and 60 fps at once.
+- **4** switches rendering between docked and handheld at once (handheld: the game's own 1280x720 output and lower
+  internal resolution, so the GPU does less).
+- **5** does nothing for now.
+
+Keys 2, 3 and 4 show a short confirmation for about 2 seconds, even with the overlay hidden, and the app remembers the
+choice for the next start (the launcher shows it). Holding a key down does not repeat it. Runs from the terminal do not
+change the launcher's settings.
 
 ## Where things are
 
@@ -394,7 +401,8 @@ Extra keys:
 
 - **Not checked yet:** cities (New Los Angeles), Skells, cutscenes, day-time lighting, water, menus beyond character
   creation, and a New Game through character creation with the current build.
-- Frame interpolation (key 2): besides its cost on an M1, characters and enemies moving on their own and rain streaks
+- Frame interpolation has no key for now (only the developer switch `TOTK_MFX`). On an M1 it costs more than it gains
+  (with 30+30 the game itself drops to about 23-27 fps), characters and enemies moving on their own and rain streaks
   ghost in the generated frames, and labels attached to enemies are half a frame ahead. Camera cuts have not been tested.
 - MetalFX spatial upscaling has not been checked with this game and is off in the presets.
 - No online features: the network is offline. The name filter accepts any name.

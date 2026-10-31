@@ -21,8 +21,22 @@ __attribute__((constructor)) static void started(void) { start_ns = runtime_now_
 
 void runtime_oe_push_message(uint32_t message) {
     pthread_mutex_lock(&lock);
-    if (tail - head < 32) { messages[tail++ % 32] = message; pthread_cond_broadcast(&message_cv); }
+    int full = tail - head >= 32;
+    if (!full) { messages[tail++ % 32] = message; pthread_cond_broadcast(&message_cv); }
     pthread_mutex_unlock(&lock);
+    if (full) fprintf(stderr, "[totk] applet message %u dropped: the queue is full (32 the game has not read)\n", message);
+}
+/* The same, unless that message is already waiting (the mode messages of key 4: the game re-reads the mode when it
+   handles one, so a second copy says nothing new). */
+int runtime_oe_push_message_once(uint32_t message) {
+    pthread_mutex_lock(&lock);
+    int r = 1;
+    for (unsigned i = head; i != tail; i++) if (messages[i % 32] == message) { r = 0; break; }
+    if (r && tail - head >= 32) r = -1;
+    if (r == 1) { messages[tail++ % 32] = message; pthread_cond_broadcast(&message_cv); }
+    pthread_mutex_unlock(&lock);
+    if (r < 0) fprintf(stderr, "[totk] applet message %u dropped: the queue is full (32 the game has not read)\n", message);
+    return r;
 }
 static void get_balance(float *l, float *r) { pthread_mutex_lock(&lock); if (l) *l = balance[0]; if (r) *r = balance[1]; pthread_mutex_unlock(&lock); }
 static void set_balance(float l, float r) {

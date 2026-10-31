@@ -271,9 +271,11 @@ static void observed_main(void) { fprintf(stderr,"[totk] ENTER nnMain\n");((void
 static void cpu_boost(int mode) { if(mode<0||mode>2)runtime_fail("unknown CPU boost mode");fprintf(stderr,"[totk] CPU boost request %d: macOS manages CPU frequency\n",mode); }
 /* TOTK_OPERATION_MODE=handheld reports the Switch handheld mode (oe OperationMode 0, PerformanceMode Normal 0) instead of
    docked (1, Boost 1): the game then uses its own handheld settings (1280x720 output, lower internal resolution), which
-   Nintendo made for half the docked GPU clock. Read once; any other value stops the start. */
-static int handheld_mode(void) {static int v=-1;if(v<0){const char *e=getenv("TOTK_OPERATION_MODE");int h;if(!e||!strcmp(e,"docked"))h=0;else if(!strcmp(e,"handheld"))h=1;else runtime_fail("TOTK_OPERATION_MODE must be docked or handheld");
- fprintf(stderr,"[totk] operation mode reported to the game: %s\n",h?"handheld (performance normal)":"docked (performance boost)");v=h;}return v;}
+   Nintendo made for half the docked GPU clock. Read at the first call; any other value stops the start. Key 4 on the
+   Mac changes it while the game runs (runtime_handheld_set, below). */
+static _Atomic int handheld_live=-1;
+static int handheld_mode(void) {int v=atomic_load(&handheld_live);if(v<0){const char *e=getenv("TOTK_OPERATION_MODE");int h;if(!e||!strcmp(e,"docked"))h=0;else if(!strcmp(e,"handheld"))h=1;else runtime_fail("TOTK_OPERATION_MODE must be docked or handheld");
+ int unset=-1;if(atomic_compare_exchange_strong(&handheld_live,&unset,h))fprintf(stderr,"[totk] operation mode reported to the game: %s\n",h?"handheld (performance normal)":"docked (performance boost)");v=atomic_load(&handheld_live);}return v;}
 int runtime_handheld_mode(void){return handheld_mode();}   /* runtime/input.c: the pad is the handheld controller then */
 static int operation_mode(void) {return handheld_mode()?0:1;}
 static int performance_mode(void) {return handheld_mode()?0:1;}
@@ -284,6 +286,27 @@ static unsigned resume_notification,operation_notification,performance_notificat
 static void resume_enabled(unsigned value) {resume_notification=value&255;}
 static void operation_enabled(unsigned value) {operation_notification=value&255;}
 static void performance_enabled(unsigned value) {performance_notification=value&255;}
+/* Key 4: docked / handheld while the game runs, the way a Switch tells a game it was (un)docked. The game reads the mode
+   once at start-up (an oe object, v200 main+0x13acdc4), enables both change notifications, and its message loop
+   (main+0x13d9a40) handles OperationModeChanged (30) and PerformanceModeChanged (31) by calling GetOperationMode /
+   GetPerformanceMode again and telling its listeners (2026-10-31 findings, read from the code). So: change the answer,
+   move the pad to the controller of that mode, then post the messages (runtime/applet_host.c's queue, which the game
+   drains with TryPopNotificationMessage), the performance one only if the game enabled it. The game changes its output
+   at once (2026-11-01, M1, 2.0.0: WindowCrop 1280x720 / 1920x1080 on each press, GPU about 12 / 19 ms a frame).
+   Until the game has enabled the operation mode notification (early start-up) it would not hear of a change and could
+   keep a pad that no longer answers: nothing is switched then (returns 0; key 4 saves the choice for the next start).
+   A message already waiting in the queue is not posted again: presses during a long load cannot fill the queue, and
+   the game reads the mode when it handles the message, so one is enough. */
+int runtime_handheld_set(int on) {
+ int was=handheld_mode();on=!!on;
+ if(!operation_notification){fprintf(stderr,"[keys] operation mode %s -> %s: not switched, the game has not enabled the mode notification yet (next start)\n",was?"handheld":"docked",on?"handheld":"docked");return 0;}
+ atomic_store(&handheld_live,on);
+ runtime_input_mode_changed();
+ int op=runtime_oe_push_message_once(30),perf=performance_notification?runtime_oe_push_message_once(31):-2;
+ static const char *const said[]={"not enabled by the game","dropped, the queue is full","already queued","posted"};
+ fprintf(stderr,"[keys] operation mode %s -> %s: operation mode changed %s, performance mode changed %s\n",was?"handheld":"docked",on?"handheld":"docked",said[op+2],said[perf+2]);
+ return 1;
+}
 static uint32_t performance_configuration[2];
 static void performance_config(int mode,int cfg) {if(mode<0||mode>1)runtime_fail("invalid performance mode");performance_configuration[mode]=(uint32_t)cfg;fprintf(stderr,"[totk] performance request mode=%d cfg=%x: native macOS scheduling\n",mode,(uint32_t)cfg);}
 /* The game's language: TOTK_LANG as given (a Switch language code), otherwise from a locale: TOTK_LOCALE, which the

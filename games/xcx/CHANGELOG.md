@@ -1755,3 +1755,77 @@ subtraction and the network task. `python3.14 -m unittest discover -s games/xcx/
 **Play-tested on Mac** (2.0.0, M1 MacBook Air, 2026-10-28, the owner's save past the division choice): the game no
 longer closes after tracking Vandham's quest, and play continued into Chapter 3. Not checked: the division reward
 appearing in game on its schedule; iPhone.
+
+### 2026-11-01: in-game toggle keys 1 to 5 (Mac)
+
+**Why.** When the game slows down (a city, a big fight) the player wants a lighter setting with one key instead of
+quitting to the launcher. Frame rate and docked / handheld could only be chosen in the launcher. Design:
+`docs/superpowers/specs/2026-10-31-in-game-toggle-keys-design.md`; feasibility tests:
+`docs/superpowers/plans/2026-10-31-in-game-toggle-keys-findings.md`.
+
+**What the keys do** (Mac key codes, US layout positions; `runtime/toggle_keys.c`, called from `runtime/input.c` for a
+fresh press only):
+- 1 (18): overlay full, smaller, FPS only, hidden. Not remembered; the launcher's HUD setting decides the start.
+- 2 (19): MetalFX scaling on or off, both steps together (`mfx_upscale`, `mfx_output`), as the launcher's scaler.
+  Frame interpolation (`mfx_interp`, before on key 2) is on no key until it is fixed; `TOTK_MFX` still works.
+- 3 (20): 30 / 60 fps, live.
+- 4 (21): docked / handheld, live.
+- 5 (23): nothing.
+- Keys 2 to 4 show a confirmation for 2 s (also with the overlay hidden) and, in app runs, write the launcher's
+  settings (`metalfx` plus `preset` = Custom, `frame_rate`, `handheld`) with CFPreferences. The launcher marks app runs
+  with `XCX_REMEMBER_KEYS=1` and passes its bundle identifier in `XCX_SETTINGS_DOMAIN` (after `execv` the game has no
+  bundle). The Custom index is `XCX_PRESET_CUSTOM` in `runtime/toggle_keys.h`, checked against the launcher's
+  `NPRESETS` at compile time. Every switch logs `[keys] <what> -> <value> (live | next start)`.
+- The window drops auto-repeat key events for 1 to 5 (a mode switch clears the held keys, which would otherwise turn a
+  repeat into a new press). iOS: no keys (`toggle_keys.c` is empty there).
+
+**Key 3, mechanism (Test A, 2.0.0 main read with capstone).** `SetVsyncCount` (main+0x13a2fd8) stores the vsync count
+N in the int32 at main+0x1d943a0 (through the GOT entry main+0x1d6ebf0; the previous N at +4). Every reader loads it
+fresh: GetFrameTime main+0x13a2520, the limiter main+0x13a9acc (again inside its spin), a frame-time function
+main+0x13a9094, the per-frame sync main+0x13a3174, GetVsyncCount main+0x13a25a4. GetVsyncCount's 4 callers
+(main+0x251e0, +0x138a50, +0x927e10, +0x13cd164) work out their steps on every call; none keeps a start-up value.
+The switch (`runtime_fps60_set`, `runtime/game_patches.c`): write N (1 = 60, 2 = 30), the host page's vsync and mode,
+`fps60_on`, and going to 60 a frame step of 1/30 s until the measured mean of 4 takes over. It refuses when N does not
+read 1 or 2. Safe at any moment; at worst one frame mixes the two steps. So the Mac app now applies the 60 fps patch at
+every start (`XCX_PATCHES` always gets `60fps`, `XCX_FPS60=0` at 30). iOS is unchanged (code patched at build time).
+
+**1.0.1 address.** The findings guessed +0xfd40 (the text's shift, main+0x1da40e0). Read from
+`rewritten/v101/main.patched.bin`: GetVsyncCount (main+0x13b22e4) loads main+0x1da33a0, and SetVsyncCount
+(main+0x13b2d18) goes through the GOT entry main+0x1d7dbf0, which holds 0x1da33a0 (+0x1d7dc00 holds 0x1da33a4). Main's
+data moved 0xf000, not 0xfd40. Key 3 uses main+0x1da33a0 on 1.0.1. Not tested in play.
+
+**Key 3, measured** (2026-10-31, MacBook Air M1, macOS 26, game 2.0.0, docked, default window, no MetalFX, East Gate
+Plain in daytime; FPS and walking speed from `XCX_CAMLOG=1`, 6 s standing then W held 7 s, speed in 1 s windows):
+
+| Run / phase | FPS standing / walking | frame p50 | walking m/s |
+|---|---|---|---|
+| no patch (`XCX_PATCHES` unset) | 29.6-30.1 / 29.9-30.1 | 33.2 ms | 8.65-8.67 |
+| patch, 30 fps mode at start (`XCX_FPS60=0`) | 30.0 / 30.1 | 33.2 ms | 8.66-8.67 |
+| live to 60, 3 times | 46.3-46.4 / 45.9-47.8 | 21.4-21.5 ms | 8.54-8.67 |
+| live to 30, 3 times | 30.1 / 30.1 | 33.2 ms | 8.63-8.67 |
+
+60 is about 46 fps on the M1 Air (GPU-bound, as on 2026-10-23); walking speed is right at both. `peek main+1d943a0`
+read N as written after each switch. No crash.
+
+**Key 4, mechanism (read from the code; Test B was stopped before a switch).** The runtime has the oe message queue
+(`runtime_oe_push_message`, `runtime/applet_host.c`). The game enables the operation-mode and performance-mode
+notifications, reads the mode once at start-up (an oe object, main+0x13acdc4), and its message loop (main+0x13d9a40)
+handles OperationModeChanged (30) by calling GetOperationMode again and its listeners' +0x10, and
+PerformanceModeChanged (31) by calling GetPerformanceMode again and its listeners' +0x18. The switch
+(`runtime_handheld_set`, `runtime/services.c`): change the mode the two getters answer, move the pad (docked: player 1
+full-key, id 0; handheld: id 0x20, which the game also supports; `runtime_input_mode_changed` clears held keys and
+works out again whether the game reads the pad), post 30 and 31. Nothing is switched before the game has enabled the
+mode notification (the choice is then saved for the next start). A message already waiting is not posted again, so
+presses during a long load cannot fill the 32-entry queue; a dropped message is logged.
+
+**Key 4, checked** (2026-11-01, M1, 2.0.0): each press showed the new output at once (`[nvn] WindowCrop 0,0 1280x720`
+to handheld, `0,0 1920x1080` back); GPU time per frame p50 about 12 ms handheld against about 19 ms docked; the game
+kept reading the pad; no crash. The owner then played with keys 1 to 4 by hand and confirmed they work.
+
+**Checked.** `tests/test_toggle_keys.py` (C harness): key 1 levels, key 2 flags and never `mfx_interp`, keys 3 and 4
+live and next-start confirmations, the 2 s confirmation, settings written only with `XCX_REMEMBER_KEYS=1`, key 5
+unbound, the launcher's preset assertion. A scripted terminal run on the title screen: the four overlay levels, key 2
+both flags, key 3 to 60 live; `defaults export org.xcnative.xcx` identical before and after. Builds: `make runtime`,
+`make launcher`, `make app` (2.0.0) clean with `-Werror`; 1.0.1 and the iOS SDK checked with syntax-only compiles.
+Not checked: key 3 during a loading screen and with fast repeated presses, the internal render size after key 4,
+MetalFX picture quality in the field, 1.0.1 in play, a full iOS build.

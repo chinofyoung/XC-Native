@@ -40,10 +40,13 @@ static const Glyph FONT[] = {
 static _Atomic int g_hints_visible = 1;
 int fps_overlay_hints_enabled(void) { return atomic_load_explicit(&g_hints_visible, memory_order_relaxed); }
 int fps_overlay_toggle_hints(void) { return !atomic_fetch_xor_explicit(&g_hints_visible, 1, memory_order_relaxed); }
+void fps_overlay_set_hints(int on) { atomic_store_explicit(&g_hints_visible, !!on, memory_order_relaxed); }
 
+/* TOTK_FPS_OVERLAY=0 hides the FPS line. With the Mac's compact HUD the overlay key (runtime/toggle_keys.c) owns that
+   instead: it starts hidden there, and key 1 can still show the line later, so the line is always published. */
 int fps_overlay_enabled(void) {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("TOTK_FPS_OVERLAY"); on = !(e && !strcmp(e, "0")); }
+    if (on < 0) { const char *e = getenv("TOTK_FPS_OVERLAY"); on = !(e && !strcmp(e, "0")) || hud_compact(); }
     return on;
 }
 
