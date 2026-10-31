@@ -399,8 +399,11 @@ change the launcher's settings.
 
 ## Known issues and what has not been checked
 
-- **Not checked yet:** cities (New Los Angeles), Skells, cutscenes, day-time lighting, water, menus beyond character
-  creation, and a New Game through character creation with the current build.
+- **Checked by the owner's playthrough (reported, not a measured test):** Mac, 2.0.0, up to Chapter 4, played at 60 fps.
+  Picture, audio, cutscenes and the city (New Los Angeles) were fine, and the rendering glitches seen earlier in New Los
+  Angeles are gone at 30 and 60 fps.
+- **Not checked yet:** Skells, day-time lighting, water, menus beyond character creation, and a New Game through
+  character creation with the current build.
 - Frame interpolation has no key for now (only the developer switch `TOTK_MFX`). On an M1 it costs more than it gains
   (with 30+30 the game itself drops to about 23-27 fps), characters and enemies moving on their own and rain streaks
   ghost in the generated frames, and labels attached to enemies are half a frame ahead. Camera cuts have not been tested.
